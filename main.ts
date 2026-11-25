@@ -1,796 +1,818 @@
-import * as fs from 'node:fs';
-import * as zlib from 'node:zlib';
+// Final edition, fresh rewrite: 24 November 2026 world news in one image.
+// Written from scratch in this session. Node standard library only.
+// Deterministic: no clock, no randomness, no network, no external assets.
+// Renders a 1024x1024 PNG to $MAKEFUN_OUTPUT_DIR/entry.png.
+//
+// Layout notes: the briefs band ("MORE FROM TUESDAY") was rebuilt with
+// tall rows so a headline, its category/source line and its status pill
+// never touch: headline on top, sub-line 7px below it, pill clear above.
+import * as fs from "node:fs";
+import * as zlib from "node:zlib";
 
-// ---------- canvas: 1024x1024 logical, 2x supersampled ----------
-const W = 1024, H = 1024, SS = 2;
-const BW = W * SS, BH = H * SS;
-const buf = Buffer.alloc(BW * BH * 3);
+const W = 1024;
+const H = 1024;
 
-function C(hex) {
-  return [parseInt(hex.slice(1, 3), 16), parseInt(hex.slice(3, 5), 16), parseInt(hex.slice(5, 7), 16)];
-}
-const PAPER = C('#F6EED7'), PANEL = C('#FDF9EC'), PANEL2 = C('#F2E6C8');
-const INK = C('#1C1A16'), NAVY = C('#23406B'), RED = C('#B23A1D'), GOLD = C('#C99A2E');
-const TEAL = C('#2E7D6B'), SKY = C('#A9C6DA'), SEA = C('#2E5A7B'), GREEN = C('#5B7F4A');
-const GRAY = C('#8A8375'), LGRAY = C('#CFC6B0'), WHITE = C('#FFFFFF'), SAND = C('#E9D9AE');
-const DARK = C('#22201B'), ORANGE = C('#E07B39'), YELLOW = C('#F2C230'), SMOKE = C('#B7AEA0');
-const MARKG = C('#2E6B3E'), MARKA = C('#8A6D1B'), MARKR = C('#B23A1D'), STEEL = C('#5A6B7A');
-const TAN = C('#C9A86A'), BRICK = C('#A85B3F'), CREAM = C('#EFE3C2'), CHARTBG = C('#FBF6E9');
+type RGB = [number, number, number];
 
-let clipX = 0, clipY = 0, clipW = W, clipH = H;
-function setClip(x, y, w, h) { clipX = x; clipY = y; clipW = w; clipH = h; }
-function clearClip() { clipX = 0; clipY = 0; clipW = W; clipH = H; }
+// ---------- palette ----------
+const NAVY: RGB = [13, 28, 48];
+const NAVY2: RGB = [26, 46, 76];
+const GOLD: RGB = [198, 158, 38];
+const GOLDDK: RGB = [146, 114, 20];
+const PAPER: RGB = [247, 242, 230];
+const PAPER2: RGB = [240, 232, 213];
+const CARDALT: RGB = [243, 238, 224];
+const WHITE: RGB = [255, 255, 255];
+const INK: RGB = [18, 22, 28];
+const GREY: RGB = [94, 100, 108];
+const LGREY: RGB = [206, 204, 196];
+const GREEN: RGB = [28, 118, 50];
+const AMBER: RGB = [150, 102, 0];
+const RED: RGB = [176, 52, 42];
+const SKY: RGB = [188, 214, 230];
+const SEA: RGB = [52, 108, 138];
+const GRASS: RGB = [96, 140, 78];
 
-function fillAll(c) {
-  for (let i = 0; i < buf.length; i += 3) { buf[i] = c[0]; buf[i + 1] = c[1]; buf[i + 2] = c[2]; }
-}
-function setPx(sx, sy, c) {
-  if (sx < 0 || sy < 0 || sx >= BW || sy >= BH) return;
-  const lx = sx / SS, ly = sy / SS;
-  if (lx < clipX || lx >= clipX + clipW || ly < clipY || ly >= clipY + clipH) return;
-  const i = (sy * BW + sx) * 3;
-  buf[i] = c[0]; buf[i + 1] = c[1]; buf[i + 2] = c[2];
-}
-function fillRect(x, y, w, h, c) {
-  const x0 = Math.max(0, Math.round(x * SS)), y0 = Math.max(0, Math.round(y * SS));
-  const x1 = Math.min(BW, Math.round((x + w) * SS)), y1 = Math.min(BH, Math.round((y + h) * SS));
-  const cx0 = Math.round(clipX * SS), cy0 = Math.round(clipY * SS);
-  const cx1 = Math.round((clipX + clipW) * SS), cy1 = Math.round((clipY + clipH) * SS);
-  for (let sy = Math.max(y0, cy0); sy < Math.min(y1, cy1); sy++) {
-    for (let sx = Math.max(x0, cx0); sx < Math.min(x1, cx1); sx++) {
-      const i = (sy * BW + sx) * 3;
-      buf[i] = c[0]; buf[i + 1] = c[1]; buf[i + 2] = c[2];
-    }
+// ---------- raster canvas ----------
+class Canvas {
+  data: Uint8Array;
+  constructor() {
+    this.data = new Uint8Array(W * H * 3);
   }
-}
-function fillCircle(cx, cy, r, c) {
-  const x0 = Math.round((cx - r) * SS), x1 = Math.round((cx + r) * SS);
-  const y0 = Math.round((cy - r) * SS), y1 = Math.round((cy + r) * SS);
-  const ccx = cx * SS, ccy = cy * SS, rr = r * SS;
-  for (let sy = Math.max(0, y0); sy < Math.min(BH, y1); sy++) {
-    for (let sx = Math.max(0, x0); sx < Math.min(BW, x1); sx++) {
-      const dx = sx + 0.5 - ccx, dy = sy + 0.5 - ccy;
-      if (dx * dx + dy * dy <= rr * rr) setPx(sx, sy, c);
-    }
+  px(x: number, y: number, c: RGB): void {
+    const ix = Math.round(x);
+    const iy = Math.round(y);
+    if (ix < 0 || iy < 0 || ix >= W || iy >= H) return;
+    const o = (iy * W + ix) * 3;
+    this.data[o] = c[0];
+    this.data[o + 1] = c[1];
+    this.data[o + 2] = c[2];
   }
-}
-function disc(cx, cy, r, c) { fillCircle(cx, cy, r, c); }
-function line(x1, y1, x2, y2, w, c) {
-  const dx = x2 - x1, dy = y2 - y1;
-  const dist = Math.hypot(dx, dy);
-  const steps = Math.max(1, Math.ceil(dist * SS * 1.5));
-  const r = w / 2;
-  for (let i = 0; i <= steps; i++) {
-    const t = i / steps;
-    disc(x1 + dx * t, y1 + dy * t, r, c);
-  }
-}
-function polyline(pts, w, c, closed) {
-  for (let i = 0; i < pts.length - 1; i++) line(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1], w, c);
-  if (closed && pts.length > 2) line(pts[pts.length - 1][0], pts[pts.length - 1][1], pts[0][0], pts[0][1], w, c);
-}
-function fillPoly(pts, c) {
-  const ys = pts.map(function (p) { return p[1]; });
-  const yMin = Math.max(0, Math.floor(Math.min.apply(null, ys)));
-  const yMax = Math.min(H - 1, Math.ceil(Math.max.apply(null, ys)));
-  for (let y = yMin; y <= yMax; y++) {
-    const yc = y + 0.5;
-    const xs = [];
-    for (let i = 0; i < pts.length; i++) {
-      const a = pts[i], b = pts[(i + 1) % pts.length];
-      if ((a[1] <= yc && b[1] > yc) || (b[1] <= yc && a[1] > yc)) {
-        xs.push(a[0] + (yc - a[1]) * (b[0] - a[0]) / (b[1] - a[1]));
+  box(x: number, y: number, w: number, h: number, c: RGB): void {
+    const x0 = Math.max(0, Math.floor(x));
+    const y0 = Math.max(0, Math.floor(y));
+    const x1 = Math.min(W, Math.ceil(x + w));
+    const y1 = Math.min(H, Math.ceil(y + h));
+    for (let yy = y0; yy < y1; yy++) {
+      let o = (yy * W + x0) * 3;
+      for (let xx = x0; xx < x1; xx++) {
+        this.data[o] = c[0];
+        this.data[o + 1] = c[1];
+        this.data[o + 2] = c[2];
+        o += 3;
       }
     }
-    xs.sort(function (p, q) { return p - q; });
-    for (let k = 0; k + 1 < xs.length; k += 2) {
-      fillRect(xs[k], y, xs[k + 1] - xs[k], 1, c);
-    }
   }
-}
-function dashedLine(x1, y1, x2, y2, w, c, dash, gap) {
-  const dx = x2 - x1, dy = y2 - y1;
-  const dist = Math.hypot(dx, dy);
-  const ux = dx / dist, uy = dy / dist;
-  let t = 0;
-  while (t < dist) {
-    const t2 = Math.min(dist, t + dash);
-    line(x1 + ux * t, y1 + uy * t, x1 + ux * t2, y1 + uy * t2, w, c);
-    t += dash + gap;
-  }
-}
-function dashedPolyline(pts, w, c, dash, gap) {
-  const period = dash + gap;
-  let offset = 0;
-  for (let i = 0; i < pts.length - 1; i++) {
-    const ax = pts[i][0], ay = pts[i][1];
-    const bx = pts[i + 1][0], by = pts[i + 1][1];
-    const remaining = Math.hypot(bx - ax, by - ay);
-    if (remaining === 0) continue;
-    const ux = (bx - ax) / remaining, uy = (by - ay) / remaining;
-    let pos = 0;
-    while (pos < remaining) {
-      const phase = (offset + pos) % period;
-      const segEnd = Math.min(remaining, pos + (phase < dash ? dash - phase : period - phase));
-      if (phase < dash) {
-        line(ax + ux * pos, ay + uy * pos, ax + ux * segEnd, ay + uy * segEnd, w, c);
+  disc(cx: number, cy: number, r: number, c: RGB): void {
+    const x0 = Math.max(0, Math.floor(cx - r));
+    const x1 = Math.min(W - 1, Math.ceil(cx + r));
+    const y0 = Math.max(0, Math.floor(cy - r));
+    const y1 = Math.min(H - 1, Math.ceil(cy + r));
+    for (let y = y0; y <= y1; y++) {
+      for (let x = x0; x <= x1; x++) {
+        const dx = x + 0.5 - cx;
+        const dy = y + 0.5 - cy;
+        if (dx * dx + dy * dy <= r * r) this.px(x, y, c);
       }
-      pos = segEnd;
     }
-    offset = (offset + remaining) % period;
   }
-}
-function arcPts(cx, cy, r, a0, a1, n) {
-  const pts = [];
-  for (let i = 0; i <= n; i++) {
-    const a = (a0 + (a1 - a0) * i / n) * Math.PI / 180;
-    pts.push([cx + r * Math.cos(a), cy + r * Math.sin(a)]);
+  ellipse(cx: number, cy: number, rx: number, ry: number, c: RGB): void {
+    const x0 = Math.max(0, Math.floor(cx - rx));
+    const x1 = Math.min(W - 1, Math.ceil(cx + rx));
+    const y0 = Math.max(0, Math.floor(cy - ry));
+    const y1 = Math.min(H - 1, Math.ceil(cy + ry));
+    for (let y = y0; y <= y1; y++) {
+      for (let x = x0; x <= x1; x++) {
+        const dx = (x + 0.5 - cx) / rx;
+        const dy = (y + 0.5 - cy) / ry;
+        if (dx * dx + dy * dy <= 1) this.px(x, y, c);
+      }
+    }
   }
-  return pts;
-}
-function fillRoundRect(x, y, w, h, r, c) {
-  fillRect(x + r, y, w - 2 * r, h, c);
-  fillRect(x, y + r, w, h - 2 * r, c);
-  fillCircle(x + r, y + r, r, c);
-  fillCircle(x + w - r, y + r, r, c);
-  fillCircle(x + r, y + h - r, r, c);
-  fillCircle(x + w - r, y + h - r, r, c);
-}
-function hline(x1, x2, y, w, c) { line(x1, y, x2, y, w, c); }
-function vline(x, y1, y2, w, c) { line(x, y1, x, y2, w, c); }
-function doubleRule(x1, x2, y, c) {
-  hline(x1, x2, y, 1.8, c);
-  hline(x1, x2, y + 4, 0.9, c);
-}
-function star(cx, cy, ro, ri, n, c) {
-  const pts = [];
-  for (let i = 0; i < n * 2; i++) {
-    const r = (i % 2 === 0) ? ro : ri;
-    const a = -Math.PI / 2 + i * Math.PI / n;
-    pts.push([cx + r * Math.cos(a), cy + r * Math.sin(a)]);
+  seg(x1: number, y1: number, x2: number, y2: number, w: number, c: RGB): void {
+    const dx = x2 - x1;
+    const dy = y2 - y1;
+    const len = Math.sqrt(dx * dx + dy * dy);
+    const steps = Math.max(1, Math.ceil(len * 2));
+    for (let i = 0; i <= steps; i++) {
+      const t = i / steps;
+      this.disc(x1 + dx * t, y1 + dy * t, w / 2, c);
+    }
   }
-  fillPoly(pts, c);
-}
-function shield(cx, cy, w, h, color) {
-  const hw = w / 2;
-  fillPoly([[cx - hw, cy - h / 2], [cx + hw, cy - h / 2], [cx + hw, cy], [cx, cy + h / 2], [cx - hw, cy]], color);
-}
-function checkMark(cx, cy, s, w, color) {
-  polyline([[cx - s, cy], [cx - s * 0.25, cy + s * 0.8], [cx + s, cy - s * 0.8]], w, color, false);
+  dash(x1: number, y1: number, x2: number, y2: number, w: number, c: RGB, on: number, off: number): void {
+    const dx = x2 - x1;
+    const dy = y2 - y1;
+    const len = Math.sqrt(dx * dx + dy * dy);
+    let d = 0;
+    while (d < len) {
+      const a = d / len;
+      const b = Math.min(1, (d + on) / len);
+      this.seg(x1 + dx * a, y1 + dy * a, x1 + dx * b, y1 + dy * b, w, c);
+      d += on + off;
+    }
+  }
+  ring(cx: number, cy: number, r: number, w: number, c: RGB): void {
+    const steps = Math.max(24, Math.ceil(2 * Math.PI * r));
+    for (let i = 0; i <= steps; i++) {
+      const a = (i / steps) * 2 * Math.PI;
+      this.disc(cx + r * Math.cos(a), cy + r * Math.sin(a), w / 2, c);
+    }
+  }
+  arcDash(cx: number, cy: number, r: number, a0: number, a1: number, w: number, c: RGB): void {
+    const steps = 72;
+    let prevX = 0;
+    let prevY = 0;
+    for (let i = 0; i <= steps; i++) {
+      const a = ((a0 + ((a1 - a0) * i) / steps) * Math.PI) / 180;
+      const px = cx + r * Math.cos(a);
+      const py = cy + r * Math.sin(a);
+      if (i > 0 && i % 4 < 2) this.seg(prevX, prevY, px, py, w, c);
+      prevX = px;
+      prevY = py;
+    }
+  }
+  poly(pts: Array<[number, number]>, c: RGB): void {
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (const p of pts) {
+      lo = Math.min(lo, p[1]);
+      hi = Math.max(hi, p[1]);
+    }
+    for (let y = Math.max(0, Math.floor(lo)); y <= Math.min(H - 1, Math.ceil(hi)); y++) {
+      const xs: number[] = [];
+      for (let i = 0; i < pts.length; i++) {
+        const a = pts[i];
+        const b = pts[(i + 1) % pts.length];
+        const mid = y + 0.5;
+        if ((a[1] <= mid && b[1] > mid) || (b[1] <= mid && a[1] > mid)) {
+          xs.push(a[0] + ((mid - a[1]) / (b[1] - a[1])) * (b[0] - a[0]));
+        }
+      }
+      xs.sort((p, q) => p - q);
+      for (let k = 0; k + 1 < xs.length; k += 2) {
+        for (let x = Math.max(0, Math.ceil(xs[k])); x <= Math.min(W - 1, Math.floor(xs[k + 1])); x++) {
+          this.px(x, y, c);
+        }
+      }
+    }
+  }
+  frame(x: number, y: number, w: number, h: number, t: number, c: RGB): void {
+    this.box(x, y, w, t, c);
+    this.box(x, y + h - t, w, t, c);
+    this.box(x, y, t, h, c);
+    this.box(x + w - t, y, t, h, c);
+  }
 }
 
-// ---------- PNG encoder (hand-rolled, zlib deflate) ----------
-const CRC_TABLE = (function () {
-  const t = [];
+const cv = new Canvas();
+
+// ---------- PNG writer (filter 0 rows, zlib level 9) ----------
+const CRC_TABLE: Int32Array = (() => {
+  const t = new Int32Array(256);
   for (let n = 0; n < 256; n++) {
-    let c = n;
-    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
-    t[n] = c >>> 0;
+    let v = n;
+    for (let k = 0; k < 8; k++) v = v & 1 ? 0xedb88320 ^ (v >>> 1) : v >>> 1;
+    t[n] = v;
   }
   return t;
 })();
-function crc32(b) {
-  let c = 0xFFFFFFFF;
-  for (let i = 0; i < b.length; i++) c = CRC_TABLE[(c ^ b[i]) & 0xFF] ^ (c >>> 8);
-  return (c ^ 0xFFFFFFFF) >>> 0;
+
+function crcOf(bytes: Uint8Array): number {
+  let crc = 0xffffffff;
+  for (let i = 0; i < bytes.length; i++) {
+    crc = CRC_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
 }
-function chunk(type, data) {
-  const len = Buffer.alloc(4);
-  len.writeUInt32BE(data.length, 0);
-  const td = Buffer.concat([Buffer.from(type, 'ascii'), data]);
-  const crc = Buffer.alloc(4);
-  crc.writeUInt32BE(crc32(td), 0);
-  return Buffer.concat([len, td, crc]);
+
+function pngChunk(kind: string, payload: Uint8Array): Buffer {
+  const head = Buffer.alloc(8);
+  head.writeUInt32BE(payload.length, 0);
+  head.write(kind, 4, "ascii");
+  const tail = Buffer.alloc(4);
+  tail.writeUInt32BE(crcOf(Buffer.concat([head.subarray(4), payload])), 0);
+  return Buffer.concat([head, Buffer.from(payload), tail]);
 }
-function encodePNG() {
+
+function encodePng(): Buffer {
   const raw = Buffer.alloc(H * (1 + W * 3));
   for (let y = 0; y < H; y++) {
     raw[y * (1 + W * 3)] = 0;
-    for (let x = 0; x < W; x++) {
-      let r = 0, g = 0, b = 0;
-      for (let sy = 0; sy < SS; sy++) {
-        for (let sx = 0; sx < SS; sx++) {
-          const i = (((y * SS + sy) * BW) + (x * SS + sx)) * 3;
-          r += buf[i]; g += buf[i + 1]; b += buf[i + 2];
-        }
-      }
-      const o = y * (1 + W * 3) + 1 + x * 3;
-      raw[o] = Math.round(r / (SS * SS));
-      raw[o + 1] = Math.round(g / (SS * SS));
-      raw[o + 2] = Math.round(b / (SS * SS));
-    }
+    Buffer.from(cv.data.buffer, y * W * 3, W * 3).copy(raw, y * (1 + W * 3) + 1);
   }
+  const idat = zlib.deflateSync(raw, { level: 9 });
   const ihdr = Buffer.alloc(13);
   ihdr.writeUInt32BE(W, 0);
   ihdr.writeUInt32BE(H, 4);
-  ihdr[8] = 8; ihdr[9] = 2; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
-  const idat = zlib.deflateSync(raw, { level: 9 });
-  return Buffer.concat([
-    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
-    chunk('IHDR', ihdr),
-    chunk('IDAT', idat),
-    chunk('IEND', Buffer.alloc(0))
-  ]);
+  ihdr[8] = 8;
+  ihdr[9] = 2;
+  const sig = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  return Buffer.concat([sig, pngChunk("IHDR", ihdr), pngChunk("IDAT", idat), pngChunk("IEND", Buffer.alloc(0))]);
 }
 
-// ---------- body font: single-stroke letterforms on an 8x12 grid ----------
-// Grid: x 0..8, y 0..11, y grows down, baseline y=11, cap top y=0.
-// A stroke is a polyline [[x,y],...] or ['c', cx, cy, r] for a filled disc.
-const GLY = {
-  'A': { a: 7.6, s: [[[1, 11], [3.5, 0], [4.5, 0], [7, 11]], [[2.4, 7], [5.6, 7]]] },
-  'B': { a: 7.6, s: [[[1, 11], [1, 0], [5.5, 0], [7, 1.5], [7, 3.8], [5.5, 5.2], [1, 5.2]], [[1, 5.2], [5.5, 5.2], [7, 6.8], [7, 9.5], [5.5, 11], [1, 11]]] },
-  'C': { a: 7.6, s: [[[7, 2.2], [5.2, 0], [2.8, 0], [1, 2], [1, 9], [2.8, 11], [5.2, 11], [7, 8.8]]] },
-  'D': { a: 7.6, s: [[[1, 11], [1, 0], [5, 0], [7, 2.2], [7, 8.8], [5, 11], [1, 11]]] },
-  'E': { a: 7.6, s: [[[1, 0], [1, 11]], [[1, 0], [6.8, 0]], [[1, 5.5], [5.6, 5.5]], [[1, 11], [6.8, 11]]] },
-  'F': { a: 7.6, s: [[[1, 0], [1, 11]], [[1, 0], [6.8, 0]], [[1, 5.5], [5.6, 5.5]]] },
-  'G': { a: 7.6, s: [[[7, 2.2], [5.2, 0], [2.8, 0], [1, 2], [1, 9], [2.8, 11], [5.2, 11], [7, 8.8], [7, 5.8], [4.6, 5.8]]] },
-  'H': { a: 7.6, s: [[[1, 0], [1, 11]], [[7, 0], [7, 11]], [[1, 5.5], [7, 5.5]]] },
-  'I': { a: 4.2, s: [[[0.8, 0], [3.4, 0]], [[2.1, 0], [2.1, 11]], [[0.8, 11], [3.4, 11]]] },
-  'J': { a: 5.6, s: [[[4.6, 0], [4.6, 8.8], [3.4, 11], [1, 11], [0.2, 9.6]]] },
-  'K': { a: 7.6, s: [[[1, 0], [1, 11]], [[1, 5.6], [7, 0]], [[2.6, 4], [7, 11]]] },
-  'L': { a: 7.6, s: [[[1, 0], [1, 11]], [[1, 11], [6.8, 11]]] },
-  'M': { a: 8.8, s: [[[1, 11], [1, 0], [4, 5.8], [7, 0], [7, 11]]] },
-  'N': { a: 7.6, s: [[[1, 11], [1, 0], [7, 11], [7, 0]]] },
-  'O': { a: 7.6, s: [[[2.6, 0], [5.4, 0], [7, 2], [7, 9], [5.4, 11], [2.6, 11], [1, 9], [1, 2], [2.6, 0]]] },
-  'P': { a: 7.6, s: [[[1, 11], [1, 0], [5.5, 0], [7, 1.5], [7, 3.8], [5.5, 5.2], [1, 5.2]]] },
-  'Q': { a: 7.6, s: [[[2.6, 0], [5.4, 0], [7, 2], [7, 9], [5.4, 11], [2.6, 11], [1, 9], [1, 2], [2.6, 0]], [[5, 9.2], [7.6, 12.6]]] },
-  'R': { a: 7.6, s: [[[1, 11], [1, 0], [5.5, 0], [7, 1.5], [7, 3.8], [5.5, 5.2], [1, 5.2]], [[3.8, 5.2], [7, 11]]] },
-  'S': { a: 7.6, s: [[[6.8, 2.4], [5, 0.4], [3, 0.4], [1.2, 2.2], [1.2, 4.2], [2.6, 5.5], [5.4, 5.5], [6.8, 6.8], [6.8, 8.8], [5, 10.6], [3, 10.6], [1.2, 8.8]]] },
-  'T': { a: 7.6, s: [[[1, 0], [7, 0]], [[4, 0], [4, 11]]] },
-  'U': { a: 7.6, s: [[[1, 0], [1, 9], [2.6, 11], [5.4, 11], [7, 9], [7, 0]]] },
-  'V': { a: 7.6, s: [[[1, 0], [4, 11], [7, 0]]] },
-  'W': { a: 9.6, s: [[[0.6, 0], [2, 11], [4, 5.8], [6, 11], [7.4, 0]]] },
-  'X': { a: 7.6, s: [[[1, 0], [7, 11]], [[7, 0], [1, 11]]] },
-  'Y': { a: 7.6, s: [[[1, 0], [4, 5.5], [7, 0]], [[4, 5.5], [4, 11]]] },
-  'Z': { a: 7.6, s: [[[1, 0], [7, 0], [1, 11], [7, 11]]] },
-  '0': { a: 7.6, s: [[[2.6, 0], [5.4, 0], [6.6, 2], [6.6, 9], [5.4, 11], [2.6, 11], [1.4, 9], [1.4, 2], [2.6, 0]]] },
-  '1': { a: 4.6, s: [[[4.4, 0], [4.4, 11]], [[2.2, 2.2], [4.4, 0]], [[2.6, 11], [6.4, 11]]] },
-  '2': { a: 7.6, s: [[[1.6, 2.6], [3, 0.4], [5.4, 0.4], [6.8, 2.4], [6.8, 4.8], [1.2, 11], [6.8, 11]]] },
-  '3': { a: 7.6, s: [[[1.6, 2.2], [3, 0.4], [5.4, 0.4], [6.8, 2.2], [6.8, 4.4], [5.4, 5.5], [6.8, 6.6], [6.8, 8.8], [5.4, 10.6], [3, 10.6], [1.6, 8.8]]] },
-  '4': { a: 7.6, s: [[[5.6, 0], [5.6, 11]], [[1, 7.6], [7, 7.6]], [[5.6, 0], [1, 7.6]]] },
-  '5': { a: 7.6, s: [[[6.8, 0], [1.2, 0], [1.2, 5], [5.6, 5], [6.8, 6.2], [6.8, 8.8], [5.4, 10.6], [3, 10.6], [1.2, 8.8]]] },
-  '6': { a: 7.6, s: [[[6.8, 2.4], [5, 0.4], [3, 0.4], [1.2, 2.4], [1.2, 8], [2.6, 10.6], [5.4, 10.6], [6.8, 9], [6.8, 6.8], [5.4, 5.2], [2.6, 5.2], [1.2, 6.8]]] },
-  '7': { a: 7.6, s: [[[1, 0], [7, 0], [3.6, 11]]] },
-  '8': { a: 7.6, s: [[[2.6, 0], [5.4, 0], [6.8, 1.6], [6.8, 4], [5.4, 5.5], [2.6, 5.5], [1.2, 4], [1.2, 1.6], [2.6, 0]], [[2.6, 5.5], [5.4, 5.5], [6.8, 7], [6.8, 9.4], [5.4, 11], [2.6, 11], [1.2, 9.4], [1.2, 7], [2.6, 5.5]]] },
-  '9': { a: 7.6, s: [[[1.2, 2], [2.6, 0.4], [5.4, 0.4], [6.8, 2], [6.8, 4.4], [5.4, 5.8], [2.6, 5.8], [1.2, 4.4]], [[6.8, 2], [6.8, 8.6], [5, 10.6], [3, 10.6], [1.2, 8.6]]] },
-  '%': { a: 11, s: [[[2.6, 0], [4.6, 0], [5.6, 1.2], [5.6, 3], [4.6, 4.2], [2.6, 4.2], [1.6, 3], [1.6, 1.2], [2.6, 0]], [[6.4, 6.8], [8.4, 6.8], [9.4, 8], [9.4, 9.8], [8.4, 11], [6.4, 11], [5.4, 9.8], [5.4, 8], [6.4, 6.8]], [[8.6, 0], [2.4, 11]]] },
-  '•': { a: 5.4, s: [['c', 2.7, 5.5, 1.5]] },
-  '–': { a: 7.6, s: [[[1.2, 5.5], [6.4, 5.5]]] },
-  '-': { a: 5.4, s: [[[1, 5.5], [4.4, 5.5]]] },
-  '/': { a: 6, s: [[[4.8, 0], [1.2, 11]]] },
-  ':': { a: 4.2, s: [['c', 2.1, 3.2, 1.1], ['c', 2.1, 8.4, 1.1]] },
-  ';': { a: 4.2, s: [['c', 2.1, 3.2, 1.1], ['c', 2.6, 9.6, 1], [[3.2, 10.2], [2.6, 11.8], [1.4, 12.6]]] },
-  '.': { a: 4.2, s: [['c', 2.1, 9.8, 1.1]] },
-  ',': { a: 4.2, s: [['c', 2.6, 9.6, 1], [[3.2, 10.2], [2.6, 11.8], [1.4, 12.6]]] },
-  "'": { a: 3.6, s: [[[2.2, 0], [1.4, 3.2]]] },
-  '+': { a: 7.6, s: [[[4, 2.2], [4, 8.8]], [[1.2, 5.5], [6.8, 5.5]]] }
+// ---------- block-letter font: 5x7 bitmaps, uniform 6-unit advance ----------
+// Every glyph is 7 rows of 5 bits. Rendered as filled cells, so letters stay
+// solid and bold from masthead size down to footnote size.
+const FONT: Record<string, string[]> = {
+  A: ["01110", "10001", "10001", "11111", "10001", "10001", "10001"],
+  B: ["11110", "10001", "10001", "11110", "10001", "10001", "11110"],
+  C: ["01110", "10001", "10000", "10000", "10000", "10001", "01110"],
+  D: ["11110", "10001", "10001", "10001", "10001", "10001", "11110"],
+  E: ["11111", "10000", "10000", "11110", "10000", "10000", "11111"],
+  F: ["11111", "10000", "10000", "11110", "10000", "10000", "10000"],
+  G: ["01110", "10001", "10000", "10111", "10001", "10001", "01111"],
+  H: ["10001", "10001", "10001", "11111", "10001", "10001", "10001"],
+  I: ["01110", "00100", "00100", "00100", "00100", "00100", "01110"],
+  J: ["00111", "00010", "00010", "00010", "00010", "10010", "01100"],
+  K: ["10001", "10010", "10100", "11000", "10100", "10010", "10001"],
+  L: ["10000", "10000", "10000", "10000", "10000", "10000", "11111"],
+  M: ["10001", "11011", "10101", "10101", "10001", "10001", "10001"],
+  N: ["10001", "11001", "10101", "10011", "10001", "10001", "10001"],
+  O: ["01110", "10001", "10001", "10001", "10001", "10001", "01110"],
+  P: ["11110", "10001", "10001", "11110", "10000", "10000", "10000"],
+  Q: ["01110", "10001", "10001", "10001", "10101", "10010", "01101"],
+  R: ["11110", "10001", "10001", "11110", "10100", "10010", "10001"],
+  S: ["01111", "10000", "10000", "01110", "00001", "00001", "11110"],
+  T: ["11111", "00100", "00100", "00100", "00100", "00100", "00100"],
+  U: ["10001", "10001", "10001", "10001", "10001", "10001", "01110"],
+  V: ["10001", "10001", "10001", "10001", "10001", "01010", "00100"],
+  W: ["10001", "10001", "10001", "10101", "10101", "10101", "01010"],
+  X: ["10001", "10001", "01010", "00100", "01010", "10001", "10001"],
+  Y: ["10001", "10001", "01010", "00100", "00100", "00100", "00100"],
+  Z: ["11111", "00001", "00010", "00100", "01000", "10000", "11111"],
+  "0": ["01110", "10001", "10011", "10101", "11001", "10001", "01110"],
+  "1": ["00100", "01100", "00100", "00100", "00100", "00100", "01110"],
+  "2": ["01110", "10001", "00001", "00010", "00100", "01000", "11111"],
+  "3": ["11110", "00001", "00001", "01110", "00001", "00001", "11110"],
+  "4": ["00010", "00110", "01010", "10010", "11111", "00010", "00010"],
+  "5": ["11111", "10000", "11110", "00001", "00001", "10001", "01110"],
+  "6": ["00110", "01000", "10000", "11110", "10001", "10001", "01110"],
+  "7": ["11111", "00001", "00010", "00100", "01000", "01000", "01000"],
+  "8": ["01110", "10001", "10001", "01110", "10001", "10001", "01110"],
+  "9": ["01110", "10001", "10001", "01111", "00001", "00010", "01100"],
+  "-": ["00000", "00000", "00000", "01110", "00000", "00000", "00000"],
+  "+": ["00000", "00100", "00100", "11111", "00100", "00100", "00000"],
+  "%": ["11001", "11010", "00010", "00100", "01000", "01011", "10011"],
+  ".": ["00000", "00000", "00000", "00000", "00000", "01100", "01100"],
+  ",": ["00000", "00000", "00000", "00000", "01100", "00100", "01000"],
+  ":": ["00000", "01100", "01100", "00000", "01100", "01100", "00000"],
+  ";": ["00000", "01100", "01100", "00000", "01100", "00100", "01000"],
+  "/": ["00001", "00010", "00010", "00100", "01000", "01000", "10000"],
+  " ": ["00000", "00000", "00000", "00000", "00000", "00000", "00000"],
 };
-function glyphAdv(ch, capH, tr) {
-  if (ch === ' ') return 4.6 * (capH / 11) + tr;
-  const g = GLY[ch];
-  const a = g ? g.a : 7.6;
-  return a * (capH / 11) + tr;
+
+function unitFor(capH: number): number {
+  return capH / 7;
 }
-function textWidth(text, capH, tr) {
-  if (!text) return 0;
-  let w = 0;
-  for (let i = 0; i < text.length; i++) w += glyphAdv(text[i], capH, tr);
-  return w - tr;
+function measure(text: string, capH: number): number {
+  if (text.length === 0) return 0;
+  return text.length * 6 * unitFor(capH) - unitFor(capH);
 }
-function drawGlyph(ch, x, baseline, capH, w, color) {
-  const g = GLY[ch];
-  if (!g) return;
-  const u = capH / 11;
-  const top = baseline - capH;
-  for (let s = 0; s < g.s.length; s++) {
-    const st = g.s[s];
-    if (st[0] === 'c') {
-      fillCircle(x + st[1] * u, top + st[2] * u, st[3] * u, color);
-    } else {
-      const pts = st.map(function (p) { return [x + p[0] * u, top + p[1] * u]; });
-      polyline(pts, w, color, false);
+function drawGlyph(ch: string, x: number, y: number, capH: number, c: RGB): void {
+  const rows = FONT[ch];
+  if (!rows) return;
+  const u = unitFor(capH);
+  for (let r = 0; r < 7; r++) {
+    const y0 = y + Math.round(r * u);
+    const y1 = y + Math.round((r + 1) * u);
+    for (let col = 0; col < 5; col++) {
+      if (rows[r][col] !== "1") continue;
+      const x0 = x + Math.round(col * u);
+      const x1 = x + Math.round((col + 1) * u);
+      cv.box(x0, y0, Math.max(1, x1 - x0), Math.max(1, y1 - y0), c);
     }
   }
 }
-function drawText(text, x, baseline, capH, w, color, align, tr) {
-  if (align === undefined) align = 'l';
-  if (tr === undefined) tr = 0;
-  const tw = textWidth(text, capH, tr);
-  let px = x;
-  if (align === 'c') px = x - tw / 2;
-  if (align === 'r') px = x - tw;
+function drawText(text: string, x: number, y: number, capH: number, c: RGB, align: "l" | "c" | "r" = "l"): void {
+  const w = measure(text, capH);
+  let cx = x;
+  if (align === "c") cx = x - w / 2;
+  if (align === "r") cx = x - w;
+  const u = unitFor(capH);
   for (let i = 0; i < text.length; i++) {
-    drawGlyph(text[i], px, baseline, capH, w, color);
-    px += glyphAdv(text[i], capH, tr);
+    drawGlyph(text[i], cx + i * 6 * u, y, capH, c);
   }
-  return tw;
 }
-function wrapText(text, maxW, capH, tr) {
-  const words = text.split(' ');
-  const lines = [];
-  let cur = '';
-  for (let i = 0; i < words.length; i++) {
-    const t = cur ? cur + ' ' + words[i] : words[i];
-    if (textWidth(t, capH, tr) <= maxW || !cur) cur = t;
-    else { lines.push(cur); cur = words[i]; }
+function wrapWords(text: string, capH: number, maxW: number): string[] {
+  const words = text.split(" ");
+  const lines: string[] = [];
+  let cur = "";
+  for (const wd of words) {
+    const trial = cur === "" ? wd : cur + " " + wd;
+    if (measure(trial, capH) <= maxW || cur === "") {
+      cur = trial;
+    } else {
+      lines.push(cur);
+      cur = wd;
+    }
   }
-  if (cur) lines.push(cur);
+  if (cur !== "") lines.push(cur);
   return lines;
 }
+// Shrink the size until the text fits in maxLines; returns [lines, size].
+function fitText(text: string, startH: number, minH: number, maxW: number, maxLines: number): [string[], number] {
+  for (let h = startH; h >= minH - 0.001; h -= 0.5) {
+    const lines = wrapWords(text, h, maxW);
+    if (lines.length <= maxLines) return [lines, h];
+  }
+  return [wrapWords(text, minH, maxW).slice(0, maxLines), minH];
+}
+function drawBlock(lines: string[], x: number, y: number, capH: number, pitch: number, c: RGB): void {
+  for (let i = 0; i < lines.length; i++) {
+    drawText(lines[i], x, y + i * pitch, capH, c, "l");
+  }
+}
 
-// ---------- display font: SOLID filled letterforms on a 12x16 grid ----------
-// Shapes: [x,y,w,h] rect, or [[x,y],...] polygon. Grid x 0..12, y 0..16.
-const DISP = {
-  '0': [[2, 0, 8, 3], [2, 13, 8, 3], [2, 3, 3, 10], [7, 3, 3, 10]],
-  '2': [[2, 0, 8, 3], [7, 3, 3, 4], [1, 13, 10, 3], [[7, 7], [10, 7], [4, 16], [1, 16]]],
-  '4': [[7, 0, 3, 16], [1, 9, 10, 3], [[8, 0], [11, 0], [4, 12], [1, 12]]],
-  '6': [[1, 2, 3, 14], [1, 13, 10, 3], [8, 9, 3, 4], [4, 9, 6, 3], [1, 2, 6, 3]],
-  'B': [[1, 0, 3, 16], [1, 0, 10, 3], [1, 6.5, 10, 3], [1, 13, 10, 3], [8, 3, 3, 3.5], [8, 9.5, 3, 3.5]],
-  'E': [[1, 0, 3, 16], [1, 0, 10, 3], [1, 6.5, 8, 3], [1, 13, 10, 3]],
-  'M': [[[1, 0], [4.5, 0], [6, 8], [7.5, 0], [11, 0], [11, 16], [8, 16], [8, 5], [6, 11], [4, 5], [4, 16], [1, 16]]],
-  'N': [[1, 0, 3, 16], [8, 0, 3, 16], [[4, 0], [7, 0], [11, 16], [8, 16]]],
-  'O': [[1, 0, 10, 3], [1, 13, 10, 3], [1, 3, 3, 10], [8, 3, 3, 10]],
-  'R': [[1, 0, 3, 16], [1, 0, 10, 3], [1, 6.5, 10, 3], [8, 3, 3, 3.5], [[5, 9.5], [8, 9.5], [11, 16], [8, 16]]],
-  'V': [[[1, 0], [4, 0], [7, 16], [4, 16]], [[8, 0], [11, 0], [8, 16], [5, 16]]]
+// ---------- stories (wordings fixed by the brief) ----------
+type Mark = "CONFIRMED" | "REPORTED" | "CLAIM";
+type Story = {
+  id: number;
+  place: string;
+  region: string;
+  field: string;
+  title: string;
+  sub: string;
+  src: string;
+  mark: Mark;
+  kind: "lead" | "card" | "brief";
 };
-function dispAdv(ch, capH, tr) {
-  if (ch === ' ') return 6 * (capH / 16) + tr;
-  return 12 * (capH / 16) + tr;
+const STORIES: Story[] = [
+  { id: 1, place: "SEOUL", region: "ASIA", field: "DEFENCE", title: "RUSSIAN JETS IN DEFENCE ZONE", sub: "NO AIRSPACE VIOLATION - FALSE ALARMS", src: "JCS / YONHAP", mark: "CONFIRMED", kind: "lead" },
+  { id: 2, place: "TOKYO / SEOUL / TAIPEI", region: "ASIA", field: "MARKETS", title: "ASIA STOCKS SURGE", sub: "TAIEX +9.0% - KOSPI +6.3% - NIKKEI +3.9% AT CLOSE", src: "REUTERS / AP", mark: "CONFIRMED", kind: "lead" },
+  { id: 3, place: "JIUQUAN", region: "ASIA", field: "SPACE", title: "SHENZHOU-24 CREW NAMED", sub: "FIRST FOREIGN ASTRONAUT ON TIANGONG; LAUNCH WED 08:18", src: "CMSA", mark: "CONFIRMED", kind: "lead" },
+  { id: 4, place: "", region: "EUROPE", field: "DEFENCE", title: "DRONE OVER POLAND, HELD FIRE", sub: "ENTERED FOR 8 MIN, TURNED BACK - MON 23:00", src: "POLISH ARMED FORCES", mark: "CONFIRMED", kind: "card" },
+  { id: 5, place: "", region: "EUROPE", field: "CONFLICT", title: "STRIKE ON ZAPORIZHZHIA", sub: "UKRAINE SAYS 2 DEAD, 22 HURT, INCL. 2 CHILDREN", src: "UKRAINIAN OFFICIALS", mark: "REPORTED", kind: "card" },
+  { id: 6, place: "", region: "MIDEAST", field: "CONFLICT", title: "GAZA: 6 DEAD ON TUESDAY", sub: "MEDICS: 3 AT KHAN YOUNIS, 3 NEAR NETZARIM", src: "MEDICS VIA REUTERS", mark: "REPORTED", kind: "card" },
+  { id: 7, place: "", region: "MIDEAST", field: "CONFLICT", title: "RIYADH TOWER HIT AGAIN", sub: "11 HURT AT PIF TOWER; UK SANCTIONS HOUTHIS", src: "SAUDI CIVIL DEFENCE", mark: "REPORTED", kind: "card" },
+  { id: 8, place: "", region: "ASIA", field: "DISASTER", title: "QUAKE SHAKES NEPAL", sub: "ABOUT 5.5; NO CASUALTIES REPORTED", src: "NCS / EMSC / USGS", mark: "CONFIRMED", kind: "card" },
+  { id: 9, place: "", region: "OCEANIA", field: "DIPLOMACY", title: "SOLOMONS DROPS CHINA PACT", sub: "TELLS BEIJING PACT ENDS; AUSTRALIA TREATY WED", src: "SMH / RNZ", mark: "REPORTED", kind: "card" },
+  { id: 10, place: "", region: "OCEANIA", field: "TECH POLICY", title: "AUSTRALIA TOUGHENS ONLINE LAW", sub: "FINES UP TO 5% OF REVENUE; NOT YET LAW", src: "GOVT ANNOUNCEMENT", mark: "REPORTED", kind: "card" },
+  { id: 11, place: "", region: "MIDEAST", field: "ENERGY", title: "TANKERS HIT IN HORMUZ", sub: "UKMTO REPORTS 3 HIT; IRAN CLAIMS MINES", src: "UKMTO / IRGC", mark: "CLAIM", kind: "card" },
+  { id: 12, place: "", region: "EUROPE", field: "SPORT", title: "REAL HIT 5; CITY, ARSENAL HELD", sub: "", src: "UEFA", mark: "CONFIRMED", kind: "brief" },
+  { id: 13, place: "", region: "N AMERICA", field: "MARKETS", title: "DOW TOPS 50,000; NASDAQ FALLS", sub: "", src: "AP / REUTERS", mark: "CONFIRMED", kind: "brief" },
+  { id: 14, place: "", region: "LATIN AMERICA", field: "HEALTH", title: "WHO URGES END TO CUBA FUEL BLOCKADE", sub: "", src: "WHO / REUTERS", mark: "CONFIRMED", kind: "brief" },
+  { id: 15, place: "", region: "N AMERICA", field: "WEATHER", title: "STORMS THREATEN THANKSGIVING", sub: "", src: "NWS / CNN", mark: "REPORTED", kind: "brief" },
+  { id: 16, place: "", region: "ASIA", field: "DIPLOMACY", title: "PYONGYANG MULLS SWISS OFFICE SHUT", sub: "", src: "N KOREA STMT", mark: "CLAIM", kind: "brief" },
+  { id: 17, place: "", region: "ASIA", field: "POLITICS", title: "DHAKA REJECTS HASINA RETURN BID", sub: "", src: "DHAKA GOVT", mark: "REPORTED", kind: "brief" },
+];
+const MARK_FILL: Record<Mark, RGB> = { CONFIRMED: GREEN, REPORTED: AMBER, CLAIM: RED };
+
+// ---------- picture scenes: flat shapes, one per story ----------
+function jetShape(cx: number, cy: number, s: number, c: RGB): void {
+  cv.poly(
+    [
+      [cx - 24 * s, cy + 9 * s],
+      [cx + 26 * s, cy],
+      [cx - 12 * s, cy + 1 * s],
+      [cx - 18 * s, cy + 12 * s],
+    ],
+    c
+  );
+  cv.poly(
+    [
+      [cx - 16 * s, cy - 1 * s],
+      [cx - 5 * s, cy - 13 * s],
+      [cx - 1 * s, cy - 1 * s],
+    ],
+    c
+  );
 }
-function dispWidth(text, capH, tr) {
-  if (!text) return 0;
-  let w = 0;
-  for (let i = 0; i < text.length; i++) w += dispAdv(text[i], capH, tr);
-  return w - tr;
-}
-function drawDispChar(ch, x, baseline, capH, color) {
-  const shapes = DISP[ch];
-  if (!shapes) return;
-  const u = capH / 16;
-  const top = baseline - capH;
-  for (let s = 0; s < shapes.length; s++) {
-    const sh = shapes[s];
-    if (typeof sh[0] === 'number') {
-      fillRect(x + sh[0] * u, top + sh[1] * u, sh[2] * u, sh[3] * u, color);
-    } else {
-      const pts = sh.map(function (p) { return [x + p[0] * u, top + p[1] * u]; });
-      fillPoly(pts, color);
+function picture(x: number, y: number, w: number, h: number, id: number): void {
+  const cx = x + w / 2;
+  if (id === 1) {
+    cv.box(x, y, w, h, SKY);
+    cv.box(x, y + h * 0.7, w, h * 0.3, SEA);
+    cv.ellipse(cx, y + h * 0.84, w * 0.3, h * 0.18, GRASS);
+    cv.poly(
+      [
+        [cx - 24, y + h * 0.64],
+        [cx - 12, y + h * 0.53],
+        [cx, y + h * 0.64],
+        [cx, y + h * 0.73],
+        [cx - 24, y + h * 0.73],
+      ],
+      [139, 92, 62]
+    );
+    cv.arcDash(cx, y + h * 0.84, Math.min(w, h) * 0.5, 200, 340, 2, RED);
+    jetShape(x + w * 0.24, y + h * 0.26, 0.9, [38, 42, 48]);
+    jetShape(x + w * 0.64, y + h * 0.15, 0.65, [58, 62, 68]);
+    cv.disc(cx + 36, y + h * 0.6, 7, RED);
+    drawText("!", cx + 36, y + h * 0.6 - 6, 12, WHITE, "c");
+  } else if (id === 2) {
+    cv.box(x, y, w, h, [233, 242, 229]);
+    const base = y + h * 0.78;
+    cv.seg(x + 14, base, x + w - 14, base, 2, INK);
+    const vals = [9.0, 6.3, 3.9];
+    const names = ["TAIEX", "KOSPI", "NIKKEI"];
+    const cols: RGB[] = [GREEN, [44, 156, 74], [126, 175, 104]];
+    for (let i = 0; i < 3; i++) {
+      const bw = 46;
+      const bx = x + 34 + i * 92;
+      const bh = (h * 0.44 * vals[i]) / 9.0;
+      cv.box(bx, base - bh, bw, bh, cols[i]);
+      drawText(vals[i].toFixed(1) + "%", bx + bw / 2, base - bh - 15, 12, INK, "c");
+      drawText(names[i], bx + bw / 2, base + 4, 9, GREY, "c");
     }
+  } else if (id === 3) {
+    cv.box(x, y, w, h, [26, 40, 72]);
+    const starPts: Array<[number, number]> = [
+      [0.1, 0.16], [0.24, 0.08], [0.42, 0.2], [0.66, 0.1], [0.82, 0.22], [0.92, 0.08], [0.55, 0.28], [0.18, 0.34],
+    ];
+    for (const s of starPts) cv.disc(x + w * s[0], y + h * s[1], 1.6, WHITE);
+    cv.disc(x + w * 0.86, y + h * 0.24, 13, [231, 227, 199]);
+    cv.box(x, y + h * 0.86, w, h * 0.14, [106, 90, 68]);
+    cv.box(cx - 34, y + h * 0.78, 68, 10, [52, 56, 62]);
+    cv.poly(
+      [
+        [cx - 13, y + h * 0.2],
+        [cx, y + h * 0.08],
+        [cx + 13, y + h * 0.2],
+      ],
+      RED
+    );
+    cv.box(cx - 13, y + h * 0.2, 26, h * 0.58, WHITE);
+    cv.disc(cx, y + h * 0.36, 6, [88, 148, 198]);
+    cv.poly(
+      [
+        [cx - 13, y + h * 0.62],
+        [cx - 26, y + h * 0.8],
+        [cx - 13, y + h * 0.78],
+      ],
+      RED
+    );
+    cv.poly(
+      [
+        [cx + 13, y + h * 0.62],
+        [cx + 26, y + h * 0.8],
+        [cx + 13, y + h * 0.78],
+      ],
+      RED
+    );
+    cv.disc(cx - 16, y + h * 0.84, 7, [178, 178, 178]);
+    cv.disc(cx + 18, y + h * 0.84, 6, [158, 158, 158]);
+  } else if (id === 4) {
+    cv.box(x, y, w, h, [218, 230, 238]);
+    cv.box(x, y + h * 0.76, w, h * 0.24, [108, 148, 98]);
+    cv.dash(cx, y + 6, cx, y + h * 0.78, 2, RED, 7, 5);
+    cv.box(x + w * 0.7, y + h * 0.42, 4, h * 0.36, [88, 88, 88]);
+    cv.box(x + w * 0.7 - 24, y + h * 0.52, 52, 5, WHITE);
+    cv.box(x + w * 0.7 - 24, y + h * 0.57, 52, 5, RED);
+    const dx = x + w * 0.3;
+    const dy = y + h * 0.3;
+    cv.box(dx - 16, dy - 6, 32, 12, [38, 42, 48]);
+    cv.seg(dx - 30, dy - 12, dx - 14, dy - 6, 2, [38, 42, 48]);
+    cv.seg(dx + 30, dy - 12, dx + 14, dy - 6, 2, [38, 42, 48]);
+    cv.seg(dx - 30, dy + 12, dx - 14, dy + 6, 2, [38, 42, 48]);
+    cv.seg(dx + 30, dy + 12, dx + 14, dy + 6, 2, [38, 42, 48]);
+    cv.ellipse(dx - 32, dy - 13, 9, 3, [38, 42, 48]);
+    cv.ellipse(dx + 32, dy - 13, 9, 3, [38, 42, 48]);
+    cv.ellipse(dx - 32, dy + 13, 9, 3, [38, 42, 48]);
+    cv.ellipse(dx + 32, dy + 13, 9, 3, [38, 42, 48]);
+    cv.dash(dx + 20, dy, x + w * 0.66, y + h * 0.22, 1.6, GREY, 5, 4);
+  } else if (id === 5) {
+    cv.box(x, y, w, h, [199, 199, 199]);
+    cv.disc(x + w * 0.62, y + h * 0.22, 16, [148, 148, 148]);
+    cv.disc(x + w * 0.72, y + h * 0.14, 11, [163, 163, 163]);
+    cv.poly(
+      [
+        [x + 30, y + h],
+        [x + 30, y + h * 0.34],
+        [x + 44, y + h * 0.3],
+        [x + 52, y + h * 0.4],
+        [x + 70, y + h * 0.34],
+        [x + 82, y + h * 0.46],
+        [x + 96, y + h * 0.38],
+        [x + 112, y + h * 0.5],
+        [x + 112, y + h],
+      ],
+      [136, 120, 104]
+    );
+    cv.box(x + 44, y + h * 0.56, 12, 14, [38, 38, 38]);
+    cv.box(x + 72, y + h * 0.56, 12, 14, [38, 38, 38]);
+    cv.box(x + 44, y + h * 0.78, 12, 14, [50, 50, 50]);
+    cv.box(x + 140, y + h * 0.6, 52, h * 0.4, [118, 108, 96]);
+    cv.seg(x + 30, y + h * 0.62, x + 60, y + h * 0.8, 2, [68, 58, 48]);
+  } else if (id === 6) {
+    cv.box(x, y, w, h, [230, 215, 174]);
+    cv.box(x, y + h * 0.62, w, h * 0.38, [188, 168, 128]);
+    cv.box(x + 16, y + h * 0.3, 28, h * 0.32, [108, 98, 86]);
+    cv.box(x + 150, y + h * 0.22, 32, h * 0.4, [128, 116, 100]);
+    cv.disc(x + w * 0.55, y + h * 0.26, 13, [148, 148, 148]);
+    cv.poly(
+      [
+        [x + w * 0.52, y + h * 0.88],
+        [x + w * 0.66, y + h * 0.6],
+        [x + w * 0.8, y + h * 0.88],
+      ],
+      WHITE
+    );
+    cv.box(x + w * 0.63, y + h * 0.66, 8, 16, RED);
+    cv.box(x + w * 0.59, y + h * 0.7, 16, 8, RED);
+  } else if (id === 7) {
+    cv.box(x, y, w, h, [212, 226, 238]);
+    cv.disc(x + w * 0.7, y + h * 0.18, 12, [148, 148, 148]);
+    cv.disc(x + w * 0.66, y + h * 0.1, 8, [163, 163, 163]);
+    cv.poly(
+      [
+        [cx - 20, y + h],
+        [cx - 26, y + h * 0.22],
+        [cx + 26, y + h * 0.22],
+        [cx + 20, y + h],
+      ],
+      [56, 72, 88]
+    );
+    for (let r = 0; r < 4; r++) {
+      for (let cI = 0; cI < 2; cI++) {
+        cv.box(cx - 16 + cI * 18, y + h * 0.3 + r * 16, 10, 8, [218, 208, 158]);
+      }
+    }
+    cv.seg(x + w * 0.84, y + h * 0.16, x + w * 0.76, y + h * 0.26, 1.6, GREY);
+    cv.disc(x + w * 0.86, y + h * 0.14, 3, INK);
+    cv.poly(
+      [
+        [cx - 30, y + h * 0.24],
+        [cx - 22, y + h * 0.16],
+        [cx - 14, y + h * 0.24],
+      ],
+      [198, 118, 38]
+    );
+  } else if (id === 8) {
+    cv.box(x, y, w, h, [232, 238, 243]);
+    cv.poly(
+      [
+        [x + 10, y + h * 0.66],
+        [x + 60, y + h * 0.18],
+        [x + 110, y + h * 0.66],
+      ],
+      [120, 136, 151]
+    );
+    cv.poly(
+      [
+        [x + 90, y + h * 0.66],
+        [x + 150, y + h * 0.1],
+        [x + 210, y + h * 0.66],
+      ],
+      [148, 162, 176]
+    );
+    cv.box(x, y + h * 0.66, w, h * 0.34, [168, 158, 138]);
+    cv.seg(x + 20, y + h * 0.7, x + 50, y + h * 0.8, 3, INK);
+    cv.seg(x + 50, y + h * 0.8, x + 80, y + h * 0.72, 3, INK);
+    cv.seg(x + 80, y + h * 0.72, x + 110, y + h * 0.86, 3, INK);
+    cv.seg(x + 110, y + h * 0.86, x + 140, y + h * 0.76, 3, INK);
+    cv.seg(x + 140, y + h * 0.76, x + 180, y + h * 0.88, 3, INK);
+    cv.poly(
+      [
+        [x + 150, y + h * 0.66],
+        [x + 150, y + h * 0.52],
+        [x + 164, y + h * 0.44],
+        [x + 178, y + h * 0.52],
+        [x + 178, y + h * 0.66],
+      ],
+      [148, 78, 58]
+    );
+    cv.ring(cx, y + h * 0.34, 26, 2, RED);
+    cv.ring(cx, y + h * 0.34, 40, 1.6, RED);
+    cv.disc(cx, y + h * 0.34, 4, RED);
+  } else if (id === 9) {
+    cv.box(x, y, w, h, [237, 230, 211]);
+    cv.box(x + w * 0.14, y + h * 0.18, w * 0.42, h * 0.56, WHITE);
+    cv.frame(x + w * 0.14, y + h * 0.18, w * 0.42, h * 0.56, 2, GREY);
+    for (let i = 0; i < 3; i++) {
+      cv.seg(x + w * 0.2, y + h * (0.3 + i * 0.13), x + w * 0.5, y + h * (0.3 + i * 0.13), 1.6, LGREY);
+    }
+    cv.box(x + w * 0.44, y + h * 0.3, w * 0.42, h * 0.56, [250, 248, 240]);
+    cv.frame(x + w * 0.44, y + h * 0.3, w * 0.42, h * 0.56, 2, GREY);
+    for (let i = 0; i < 3; i++) {
+      cv.seg(x + w * 0.5, y + h * (0.42 + i * 0.13), x + w * 0.8, y + h * (0.42 + i * 0.13), 1.6, LGREY);
+    }
+    cv.disc(x + w * 0.68, y + h * 0.3, 13, RED);
+    cv.disc(x + w * 0.68, y + h * 0.3, 8, WHITE);
+    cv.disc(x + w * 0.68, y + h * 0.3, 3, RED);
+    cv.seg(x + w * 0.22, y + h * 0.82, x + w * 0.42, y + h * 0.74, 3, INK);
+  } else if (id === 10) {
+    cv.box(x, y, w, h, [230, 236, 243]);
+    cv.box(cx - 36, y + 6, 72, h - 10, [32, 36, 42]);
+    cv.box(cx - 30, y + 12, 60, h - 22, [218, 230, 238]);
+    drawText("5%", cx, y + h * 0.32, 26, RED, "c");
+    cv.seg(x + w * 0.16, y + h * 0.22, x + w * 0.24, y + h * 0.22, 2, INK);
+    cv.seg(x + w * 0.76, y + h * 0.22, x + w * 0.84, y + h * 0.22, 2, INK);
+  } else if (id === 11) {
+    cv.box(x, y, w, h, [205, 222, 232]);
+    cv.box(x, y + h * 0.58, w, h * 0.42, SEA);
+    for (let i = 0; i < 3; i++) {
+      const tx = x + 22 + i * 74;
+      cv.box(tx, y + h * 0.44, 58, 14, [28, 28, 32]);
+      cv.box(tx + 38, y + h * 0.3, 16, 14, WHITE);
+      if (i === 1) {
+        cv.disc(tx + 20, y + h * 0.34, 9, [148, 148, 148]);
+        cv.poly(
+          [
+            [tx + 14, y + h * 0.3],
+            [tx + 20, y + h * 0.2],
+            [tx + 26, y + h * 0.3],
+          ],
+          [218, 118, 28]
+        );
+      }
+    }
+    cv.dash(x + 8, y + h * 0.7, x + w - 8, y + h * 0.7, 1.6, WHITE, 6, 5);
   }
-}
-function drawDisplay(text, x, baseline, capH, color, align, tr) {
-  if (align === undefined) align = 'l';
-  if (tr === undefined) tr = 0;
-  const tw = dispWidth(text, capH, tr);
-  let px = x;
-  if (align === 'c') px = x - tw / 2;
-  if (align === 'r') px = x - tw;
-  for (let i = 0; i < text.length; i++) {
-    drawDispChar(text[i], px, baseline, capH, color);
-    px += dispAdv(text[i], capH, tr);
-  }
-  return tw;
 }
 
-// ---------- picture scenes (fresh drawings, same compositions as v6) ----------
-function sceneKorea(x, y, w, h) {
-  setClip(x, y, w, h);
-  fillRect(x, y, w, h * 0.62, SKY);
-  fillRect(x, y + h * 0.62, w, h * 0.38, SEA);
-  line(x + w * 0.08, y + h * 0.7, x + w * 0.3, y + h * 0.7, 2, WHITE);
-  line(x + w * 0.42, y + h * 0.78, x + w * 0.62, y + h * 0.78, 2, WHITE);
-  line(x + w * 0.7, y + h * 0.68, x + w * 0.9, y + h * 0.68, 2, WHITE);
-  const jx = x + w * 0.3, jy = y + h * 0.3;
-  fillPoly([[jx, jy - 10], [jx + 26, jy + 3], [jx, jy + 6], [jx + 5, jy + 2]], NAVY);
-  const jx2 = x + w * 0.62, jy2 = y + h * 0.22;
-  fillPoly([[jx2, jy2 - 8], [jx2 + 22, jy2 + 2], [jx2, jy2 + 5], [jx2 + 4, jy2 + 1]], DARK);
-  const arc = arcPts(x + w * 0.5, y + h * 1.05, h * 0.85, 200, 340, 26);
-  dashedPolyline(arc, 2, RED, 7, 6);
-  const tx = x + w * 0.1, ty = y + h * 0.16;
-  fillPoly([[tx, ty], [tx + 14, ty], [tx + 7, ty + 12]], YELLOW);
-  line(tx + 7, ty + 3, tx + 7, ty + 7, 2, INK);
-  disc(tx + 7, ty + 9.5, 1.2, INK);
-  clearClip();
+// ---------- status pill ----------
+function pillWidth(mark: string, capH: number): number {
+  return measure(mark, capH) + 12;
 }
-function sceneStocks(x, y, w, h) {
-  setClip(x, y, w, h);
-  fillRect(x, y, w, h, CHARTBG);
-  dashedLine(x + 6, y + h * 0.55, x + w - 6, y + h * 0.55, 1.2, LGRAY, 6, 5);
-  const base = y + h - 16;
-  const bw = Math.min(40, w * 0.16);
-  const vals = [['NIKKEI', 4.5, NAVY, '+4.5'], ['KOSPI', 7.5, RED, '+7.5'], ['TAIWAN', 9.1, TEAL, '+9.1']];
-  const gap = (w - 3 * bw) / 4;
-  for (let i = 0; i < 3; i++) {
-    const bx = x + gap + i * (bw + gap);
-    const bh = (h - 34) * vals[i][1] / 9.1;
-    fillRect(bx, base - bh, bw, bh, vals[i][2]);
-    drawText(vals[i][3], bx + bw / 2, base - bh - 6, 11, 2.2, vals[i][2], 'c', 0);
-    drawText(vals[i][0], bx + bw / 2, base + 11, 8.5, 1.5, GRAY, 'c', 0);
-  }
-  hline(x + 6, x + w - 6, base, 2, INK);
-  clearClip();
-}
-function sceneRocket(x, y, w, h) {
-  setClip(x, y, w, h);
-  fillRect(x, y, w, h, NAVY);
-  const stars = [[0.12, 0.16], [0.26, 0.08], [0.4, 0.2], [0.58, 0.1], [0.72, 0.18], [0.88, 0.09], [0.94, 0.32], [0.08, 0.44], [0.9, 0.52], [0.18, 0.56], [0.8, 0.62]];
-  for (let i = 0; i < stars.length; i++) {
-    const sx = x + w * stars[i][0], sy = y + h * stars[i][1];
-    line(sx - 3, sy, sx + 3, sy, 1.4, WHITE);
-    line(sx, sy - 3, sx, sy + 3, 1.4, WHITE);
-  }
-  const cx = x + w * 0.5, top = y + h * 0.12, bw2 = Math.min(28, w * 0.1);
-  fillRect(x + w * 0.2, y + h * 0.86, w * 0.6, 5, STEEL);
-  fillPoly([[cx - bw2 / 2, top + 24], [cx, top], [cx + bw2 / 2, top + 24]], RED);
-  fillRoundRect(cx - bw2 / 2, top + 22, bw2, 58, 7, WHITE);
-  fillPoly([[cx - bw2 / 2, top + 48], [cx - bw2 / 2 - 13, top + 76], [cx - bw2 / 2, top + 76]], RED);
-  fillPoly([[cx + bw2 / 2, top + 48], [cx + bw2 / 2 + 13, top + 76], [cx + bw2 / 2, top + 76]], RED);
-  fillCircle(cx, top + 40, 6, SKY);
-  fillPoly([[cx - 7, top + 80], [cx + 7, top + 80], [cx, top + 100]], ORANGE);
-  fillPoly([[cx - 3.5, top + 80], [cx + 3.5, top + 80], [cx, top + 94]], YELLOW);
-  line(x + w * 0.14, y + h * 0.88, x + w * 0.14, y + h * 0.88 - 32, 2, WHITE);
-  fillRect(x + w * 0.14, y + h * 0.88 - 32, 20, 13, RED);
-  line(x + w * 0.86, y + h * 0.88, x + w * 0.86, y + h * 0.88 - 32, 2, WHITE);
-  fillRect(x + w * 0.86 - 20, y + h * 0.88 - 32, 20, 13, TEAL);
-  clearClip();
-}
-function sceneDrone(x, y, w, h) {
-  setClip(x, y, w, h);
-  fillRect(x, y, w, h * 0.68, TAN);
-  fillRect(x, y + h * 0.68, w, h * 0.32, GREEN);
-  const bx = x + 8, by = y + 5, bw = w * 0.6, bh = h - 10;
-  dashedLine(bx, by, bx + bw, by, 2, RED, 7, 5);
-  dashedLine(bx + bw, by, bx + bw, by + bh, 2, RED, 7, 5);
-  dashedLine(bx + bw, by + bh, bx, by + bh, 2, RED, 7, 5);
-  dashedLine(bx, by + bh, bx, by, 2, RED, 7, 5);
-  const dx = x + w * 0.32, dy = y + h * 0.4;
-  line(dx - 6, dy - 4, dx - 26, dy - 18, 2.4, DARK);
-  line(dx + 6, dy - 4, dx + 26, dy - 18, 2.4, DARK);
-  line(dx - 40, dy - 18, dx - 12, dy - 18, 3, DARK);
-  line(dx + 12, dy - 18, dx + 40, dy - 18, 3, DARK);
-  fillCircle(dx - 26, dy - 18, 3.4, DARK);
-  fillCircle(dx + 26, dy - 18, 3.4, DARK);
-  fillRoundRect(dx - 11, dy - 7, 22, 13, 5, DARK);
-  line(dx, dy + 6, dx, dy + 11, 2.4, DARK);
-  fillCircle(dx, dy + 13, 3.4, DARK);
-  fillCircle(dx + 6, dy - 1, 2.4, RED);
-  shield(x + w * 0.78, y + h * 0.42, 38, 50, NAVY);
-  checkMark(x + w * 0.78, y + h * 0.42 - 2, 9, 3.2, WHITE);
-  fillCircle(x + w * 0.05, y + h * 0.3, 5, WHITE);
-  fillCircle(x + w * 0.09, y + h * 0.34, 3.5, WHITE);
-  clearClip();
-}
-function sceneStrike(x, y, w, h) {
-  setClip(x, y, w, h);
-  fillRect(x, y, w, h, CREAM);
-  fillRect(x + w * 0.08, y + h * 0.3, w * 0.3, h * 0.62, DARK);
-  for (let r = 0; r < 3; r++) {
-    for (let c = 0; c < 2; c++) {
-      fillRect(x + w * 0.13 + c * w * 0.11, y + h * 0.38 + r * h * 0.18, w * 0.05, h * 0.08, YELLOW);
-    }
-  }
-  fillRect(x + w * 0.5, y + h * 0.45, w * 0.24, h * 0.47, STEEL);
-  star(x + w * 0.42, y + h * 0.34, 16, 7, 8, YELLOW);
-  star(x + w * 0.42, y + h * 0.34, 9, 4, 8, ORANGE);
-  fillCircle(x + w * 0.68, y + h * 0.2, 9, SMOKE);
-  fillCircle(x + w * 0.76, y + h * 0.26, 6, SMOKE);
-  hline(x, x + w, y + h - 4, 2, INK);
-  clearClip();
-}
-function sceneGaza(x, y, w, h) {
-  setClip(x, y, w, h);
-  fillRect(x, y, w, h * 0.66, SKY);
-  fillRect(x, y + h * 0.66, w, h * 0.34, SAND);
-  fillRect(x + w * 0.06, y + h * 0.34, w * 0.22, h * 0.58, TAN);
-  fillRect(x + w * 0.34, y + h * 0.22, w * 0.26, h * 0.7, BRICK);
-  fillRect(x + w * 0.66, y + h * 0.42, w * 0.24, h * 0.5, STEEL);
-  for (let i = 0; i < 3; i++) {
-    fillRect(x + w * 0.1 + i * w * 0.07, y + h * 0.42, w * 0.04, h * 0.06, DARK);
-    fillRect(x + w * 0.38 + i * w * 0.08, y + h * 0.3, w * 0.04, h * 0.06, DARK);
-  }
-  fillCircle(x + w * 0.5, y + h * 0.14, 8, SMOKE);
-  fillCircle(x + w * 0.57, y + h * 0.1, 6, SMOKE);
-  fillCircle(x + w * 0.86, y + h * 0.22, 11, WHITE);
-  line(x + w * 0.86 - 6, y + h * 0.22, x + w * 0.86 + 6, y + h * 0.22, 3, RED);
-  line(x + w * 0.86, y + h * 0.22 - 6, x + w * 0.86, y + h * 0.22 + 6, 3, RED);
-  clearClip();
-}
-function sceneTanker(x, y, w, h) {
-  setClip(x, y, w, h);
-  fillRect(x, y, w, h * 0.55, SKY);
-  fillRect(x, y + h * 0.55, w, h * 0.45, SEA);
-  line(x + w * 0.05, y + h * 0.66, x + w * 0.3, y + h * 0.66, 2, WHITE);
-  line(x + w * 0.55, y + h * 0.74, x + w * 0.8, y + h * 0.74, 2, WHITE);
-  line(x + w * 0.2, y + h * 0.86, x + w * 0.5, y + h * 0.86, 2, WHITE);
-  fillPoly([[x + w * 0.06, y + h * 0.42], [x + w * 0.9, y + h * 0.42], [x + w * 0.8, y + h * 0.62], [x + w * 0.16, y + h * 0.62]], DARK);
-  fillRect(x + w * 0.3, y + h * 0.3, w * 0.12, h * 0.12, GOLD);
-  fillRect(x + w * 0.44, y + h * 0.3, w * 0.12, h * 0.12, TEAL);
-  fillRect(x + w * 0.62, y + h * 0.26, w * 0.1, h * 0.16, WHITE);
-  fillPoly([[x + w * 0.56, y + h * 0.28], [x + w * 0.6, y + h * 0.14], [x + w * 0.64, y + h * 0.28]], ORANGE);
-  star(x + w * 0.88, y + h * 0.72, 9, 4, 8, DARK);
-  fillCircle(x + w * 0.88, y + h * 0.72, 3, DARK);
-  clearClip();
-}
-function sceneQuake(x, y, w, h) {
-  setClip(x, y, w, h);
-  fillRect(x, y, w, h, C('#DCE4E6'));
-  fillPoly([[x, y + h], [x + w * 0.3, y + h * 0.3], [x + w * 0.55, y + h * 0.62], [x + w * 0.7, y + h]], STEEL);
-  fillPoly([[x + w * 0.45, y + h], [x + w * 0.68, y + h * 0.22], [x + w * 0.95, y + h * 0.6], [x + w, y + h]], NAVY);
-  fillPoly([[x + w * 0.26, y + h * 0.36], [x + w * 0.3, y + h * 0.3], [x + w * 0.34, y + h * 0.36]], WHITE);
-  const ax = x + w * 0.52, ay = y + h * 0.6;
-  for (let r = 0; r < 3; r++) {
-    polyline(arcPts(ax, ay, 10 + r * 9, 200, 340, 14), 2.2, RED, false);
-  }
-  fillRect(x + 8, y + 6, 46, 18, RED);
-  drawText('M5.5', x + 31, y + 19, 10, 2, WHITE, 'c', 0);
-  clearClip();
-}
-function sceneTreaty(x, y, w, h) {
-  setClip(x, y, w, h);
-  fillRect(x, y, w, h, CREAM);
-  const px = x + w * 0.08, py = y + h * 0.14, pw = w * 0.42, ph = h * 0.72;
-  fillRect(px, py, pw, ph, WHITE);
-  hline(px, px + pw, py, 1.2, LGRAY);
-  hline(px, px + pw, py + ph, 1.2, LGRAY);
-  vline(px, py, py + ph, 1.2, LGRAY);
-  vline(px + pw, py, py + ph, 1.2, LGRAY);
-  for (let i = 0; i < 3; i++) hline(px + 8, px + pw - 8, py + 12 + i * 11, 1.6, GRAY);
-  line(px + 8, py + ph - 10, px + pw * 0.55, py + ph - 10, 1.6, INK);
-  fillCircle(px + pw - 14, py + ph - 14, 7, RED);
-  star(px + pw - 14, py + ph - 14, 4, 2, 5, WHITE);
-  const f1x = x + w * 0.62, f2x = x + w * 0.82;
-  line(f1x, y + h * 0.16, f1x, y + h * 0.88, 2, INK);
-  line(f2x, y + h * 0.16, f2x, y + h * 0.88, 2, INK);
-  fillRect(f1x, y + h * 0.16, 24, 9, GOLD);
-  fillRect(f1x, y + h * 0.25, 24, 9, TEAL);
-  fillRect(f2x, y + h * 0.16, 24, 18, NAVY);
-  fillCircle(f2x + 12, y + h * 0.25, 2, WHITE);
-  fillCircle(f2x + 6, y + h * 0.2, 1.4, WHITE);
-  fillCircle(f2x + 18, y + h * 0.2, 1.4, WHITE);
-  fillCircle(f2x + 6, y + h * 0.3, 1.4, WHITE);
-  fillCircle(f2x + 18, y + h * 0.3, 1.4, WHITE);
-  clearClip();
-}
-function scenePhone(x, y, w, h) {
-  setClip(x, y, w, h);
-  fillRect(x, y, w, h, CREAM);
-  const pw = Math.min(72, w * 0.3), ph = h * 0.8;
-  const px = x + w * 0.24, py = y + h * 0.1;
-  fillRoundRect(px, py, pw, ph, 7, DARK);
-  fillRoundRect(px + 5, py + 7, pw - 10, ph - 14, 4, WHITE);
-  drawText('5%', px + pw / 2, py + ph * 0.58, 15, 2.6, NAVY, 'c', 0);
-  line(px + 8, py + ph - 11, px + pw - 8, py + ph - 11, 1.8, LGRAY);
-  shield(x + w * 0.74, y + h * 0.6, 36, 46, GOLD);
-  checkMark(x + w * 0.74, y + h * 0.6 - 2, 8, 3, WHITE);
-  clearClip();
+function drawPill(mark: Mark, x: number, y: number, h: number, capH: number): void {
+  const pw = pillWidth(mark, capH);
+  cv.box(x, y, pw, h, MARK_FILL[mark]);
+  drawText(mark, x + pw / 2, y + (h - capH) / 2, capH, WHITE, "c");
 }
 
-// ---------- panels (geometry kept from v6; type re-set in the new fonts) ----------
-const M = 30, CW = W - 2 * M;
-const PAD = 12;
-const GAP_TITLE_SUB = 8, GAP_SUB_SRC = 8, GAP_SRC_BOTTOM = 10;
-const REGION_COLOR = { 'ASIA': NAVY, 'EUROPE': TEAL, 'MIDEAST': RED, 'OCEANIA': GOLD, 'N AMERICA': STEEL };
-const MARK_COLOR = { 'CONFIRMED': MARKG, 'REPORTED': MARKA, 'CLAIM': MARKR };
-
-function panel(x, y, w, h, band) {
-  fillRect(x, y, w, h, PANEL);
-  hline(x, x + w, y, 1.2, INK);
-  hline(x, x + w, y + h, 1.2, INK);
-  vline(x, y, y + h, 1.2, INK);
-  vline(x + w, y, y + h, 1.2, INK);
-  fillRect(x, y, w, 5, band);
-}
-function panelAlt(x, y, w, h, band) {
-  fillRect(x, y, w, h, PANEL2);
-  hline(x, x + w, y, 1.2, INK);
-  hline(x, x + w, y + h, 1.2, INK);
-  vline(x, y, y + h, 1.2, INK);
-  vline(x + w, y, y + h, 1.2, INK);
-  fillRect(x, y, w, 5, band);
-}
-function srcMarkRow(x, innerW, baseline, src, mark, capH) {
-  let s = capH;
-  const markW = textWidth(mark, 9.5, 0.5);
-  while (s > 8 && textWidth(src, s, 0) + markW + 12 > innerW) s -= 0.5;
-  drawText(src, x, baseline, s, 1.7, GRAY, 'l', 0);
-  drawText(mark, x + innerW, baseline, 9.5, 2.2, MARK_COLOR[mark], 'r', 0.5);
-}
-function storyText(x, topY, innerW, title, titleCap, sub, subCap, srcBaseline) {
-  let tc = titleCap, sc = subCap;
-  for (let attempt = 0; attempt < 9; attempt++) {
-    const tLines = wrapText(title, innerW, tc, 0);
-    const sLines = wrapText(sub, innerW, sc, 0);
-    const titleBottom = topY + tc + (tLines.length - 1) * (tc + 5);
-    const subTop = titleBottom + GAP_TITLE_SUB;
-    const subBottom = subTop + sc + (sLines.length - 1) * (sc + 3.5);
-    if (subBottom + GAP_SUB_SRC <= srcBaseline || (tc <= 12 && sc <= 9)) {
-      let by = topY + tc;
-      for (const ln of tLines) { drawText(ln, x, by, tc, Math.max(2.4, tc * 0.19), INK, 'l', 0); by += tc + 5; }
-      by = subTop + sc;
-      for (const ln of sLines) { drawText(ln, x, by, sc, 1.7, INK, 'l', 0); by += sc + 3.5; }
-      return;
-    }
-    tc = Math.max(12, tc - 1);
-    sc = Math.max(9, sc - 0.5);
+// ---------- lead / card panel ----------
+function drawPanel(s: Story, x: number, y: number, w: number, h: number, lead: boolean, picH: number): void {
+  const bg = lead ? WHITE : s.id % 2 === 0 ? WHITE : CARDALT;
+  cv.box(x, y, w, h, bg);
+  cv.frame(x, y, w, h, 2, [58, 58, 58]);
+  picture(x + 2, y + 2, w - 4, picH - 4, s.id);
+  cv.box(x, y + picH, w, 2, GOLD);
+  const tx = x + 10;
+  const tw = w - 20;
+  let ty = y + picH + 7;
+  if (lead) {
+    drawText("LEAD 0" + s.id + " - " + s.place, tx, ty, 11, GOLDDK, "l");
+    ty += 14;
+    drawText(s.region + " / " + s.field, tx, ty, 10, GREY, "l");
+    ty += 13;
+  } else {
+    drawText(s.region + " / " + s.field, tx, ty, 10, GOLDDK, "l");
+    ty += 13;
   }
-}
-function drawStoryPanel(x, y, w, h, story, sceneFn, alt, sceneH) {
-  if (alt) panelAlt(x, y, w, h, REGION_COLOR[story.region]); else panel(x, y, w, h, REGION_COLOR[story.region]);
-  const ix = x + PAD, iw = w - 2 * PAD;
-  sceneFn(x + 1, y + 6, w - 2, sceneH);
-  const kickerBase = y + 6 + sceneH + 19;
-  drawText(story.kicker, ix, kickerBase, 10, 2, REGION_COLOR[story.region], 'l', 1.5);
-  const srcBaseline = y + h - GAP_SRC_BOTTOM;
-  storyText(ix, kickerBase + GAP_TITLE_SUB, iw, story.title, story.titleCap, story.sub, story.subCap, srcBaseline - 9.5);
-  srcMarkRow(ix, iw, srcBaseline, story.src, story.mark, 9.5);
+  const srcTop = y + h - 19;
+  const [tLines, tH] = fitText(s.title, lead ? 20 : 15, lead ? 17 : 12, tw, 2);
+  const titleBottom = ty + tLines.length * (tH + 3) - 3;
+  drawBlock(tLines, tx, ty, tH, tH + 3, INK);
+  // Sub-lines get whatever vertical room is left above the source row,
+  // shrinking if needed, so they can never reach the source row.
+  const room = srcTop - 3 - titleBottom;
+  let subH = lead ? 12 : 10.5;
+  let subLines = wrapWords(s.sub, subH, tw);
+  while (subLines.length * (subH + 2) - 2 > room && subH > 8.5) {
+    subH -= 0.5;
+    subLines = wrapWords(s.sub, subH, tw);
+  }
+  if (subLines.length > 2) subLines = subLines.slice(0, 2);
+  drawBlock(subLines, tx, titleBottom + 3, subH, subH + 2, [50, 54, 60]);
+  // Source + mark row, pinned to the bottom, with a shrink guard so the
+  // source text can never run into the pill.
+  let srcH = 9.5;
+  const pw = pillWidth(s.mark, 10);
+  while (measure(s.src, srcH) + pw + 10 > tw && srcH > 8) srcH -= 0.5;
+  drawText(s.src, tx, srcTop + 2, srcH, GREY, "l");
+  drawPill(s.mark, x + w - 10 - pw, srcTop, 16, 10);
 }
 
-// ---------- story data (verified 24 Nov list; wording per brief bans) ----------
-const LEADS = [
-  { kicker: 'LEAD 01 - SEOUL', region: 'ASIA', field: 'DEFENCE', title: 'RUSSIAN JETS IN DEFENCE ZONE', sub: 'NO AIRSPACE VIOLATION - FALSE ALARMS', src: 'JCS / YONHAP', mark: 'CONFIRMED', titleCap: 17, subCap: 11.5 },
-  { kicker: 'LEAD 02 - TOKYO / SEOUL / TAIPEI', region: 'ASIA', field: 'MARKETS', title: 'ASIA STOCKS SURGE', sub: 'CHIP SHARES LEAD; SNAPSHOTS, NOT CLOSES', src: 'REUTERS', mark: 'CONFIRMED', titleCap: 17, subCap: 11.5 },
-  { kicker: 'LEAD 03 - JIUQUAN', region: 'ASIA', field: 'SPACE', title: 'SHENZHOU-24 CREW NAMED', sub: 'FIRST FOREIGN ASTRONAUT ON TIANGONG; LAUNCH WED 08:18', src: 'CMSA', mark: 'CONFIRMED', titleCap: 17, subCap: 11.5 }
-];
-const CARDS1 = [
-  { kicker: 'EUROPE - DEFENCE', region: 'EUROPE', field: 'DEFENCE', title: 'DRONE OVER POLAND, HELD FIRE', sub: 'CROSSED NEAR DOROHUSK, TURNED BACK - MON 23:00', src: 'POLISH ARMED FORCES', mark: 'CONFIRMED', titleCap: 13.5, subCap: 10 },
-  { kicker: 'EUROPE - CONFLICT', region: 'EUROPE', field: 'CONFLICT', title: 'STRIKE ON ZAPORIZHZHIA', sub: 'UKRAINE SAYS 2 DEAD, 22 HURT, INCL. 2 CHILDREN', src: 'UKRAINIAN OFFICIALS', mark: 'REPORTED', titleCap: 13.5, subCap: 10 },
-  { kicker: 'MIDEAST - CONFLICT', region: 'MIDEAST', field: 'CONFLICT', title: 'GAZA: 9 DEAD IN 24 HOURS', sub: 'MEDICS COUNT 9 DEAD, 3 AT KHAN YOUNIS POST', src: 'MEDICS VIA REUTERS', mark: 'REPORTED', titleCap: 13.5, subCap: 10 },
-  { kicker: 'MIDEAST - ENERGY', region: 'MIDEAST', field: 'ENERGY', title: 'TANKERS ABLAZE CLAIM', sub: 'IRAN CLAIMS MINES; U.S. PROBES SHIP HACKS', src: 'IRGC / WSJ', mark: 'CLAIM', titleCap: 13.5, subCap: 10 }
-];
-const CARDS2 = [
-  { kicker: 'ASIA - DISASTER', region: 'ASIA', field: 'DISASTER', title: 'QUAKE SHAKES NEPAL', sub: 'ABOUT 5.5; NO CASUALTIES REPORTED', src: 'NCS / EMSC / USGS', mark: 'CONFIRMED', titleCap: 13.5, subCap: 10 },
-  { kicker: 'OCEANIA - DIPLOMACY', region: 'OCEANIA', field: 'DIPLOMACY', title: 'SOLOMONS WARNED ON CHINA PACT', sub: 'SOGAVARE WARNS GOVT; WALE SIGNS TREATY WED', src: 'RNZ', mark: 'REPORTED', titleCap: 13.5, subCap: 10 },
-  { kicker: 'OCEANIA - TECH POLICY', region: 'OCEANIA', field: 'TECH POLICY', title: 'AUSTRALIA TOUGHENS ONLINE LAW', sub: 'FINES UP TO 5% OF REVENUE; NOT YET LAW', src: 'GOVT ANNOUNCEMENT', mark: 'REPORTED', titleCap: 13.5, subCap: 10 }
-];
-const BRIEFS = [
-  { num: '11', region: 'EUROPE', field: 'SPORT', title: 'CHAMPIONS LEAGUE: 9 TIES TONIGHT', src: 'UEFA', mark: 'CONFIRMED' },
-  { num: '12', region: 'ASIA', field: 'POLITICS', title: 'PRABOWO NAMES VP PICKS', src: 'JAPAN TIMES', mark: 'REPORTED' },
-  { num: '13', region: 'ASIA', field: 'DISASTER', title: 'PAKISTAN HIT BY 4.1 QUAKE', src: 'NCS', mark: 'CONFIRMED' },
-  { num: '14', region: 'N AMERICA', field: 'WEATHER', title: 'STORMS THREATEN THANKSGIVING', src: 'NWS / CNN', mark: 'REPORTED' },
-  { num: '15', region: 'ASIA', field: 'DIPLOMACY', title: 'PYONGYANG MULLS SWISS OFFICE SHUT', src: 'N KOREA STMT', mark: 'CLAIM' },
-  { num: '16', region: 'ASIA', field: 'POLITICS', title: 'HASINA PLANS DEC 16 RETURN', src: 'SPOKESPERSON', mark: 'CLAIM' }
-];
-const DAY_STRIP = [
-  ['01:32 UTC', 'NEPAL QUAKE', NAVY],
-  ['07:52 KST', 'KADIZ FALSE ALARM', RED],
-  ['MON 23:00', 'DRONE OVER POLAND', NAVY],
-  ['+7.5%', 'KOSPI, INTRADAY', TEAL],
-  ['22', 'HORMUZ ATTACKS IN NOV', RED]
-];
-const MAP_ROWS = [
-  '   11........11...111......',
-  '  1111......1111..111111....',
-  '  11111.....11.111.1111111...',
-  '   1111......11...11111.....',
-  '    11.......11...11....1...',
-  '    111......11........1...',
-  '     11.......1............',
-  '     1.....................'
-];
-const DATE_CHECK = ['LIBYA STRIKE - NOV 22', 'COP31 COLLAPSE - NOV 22', 'NVIDIA CEO RETURNS - NOV 23'];
+// ---------- brief row: headline / sub-line / pill kept apart by construction ----------
+function drawBrief(s: Story, x: number, y: number, w: number, h: number): void {
+  cv.box(x, y, w, h, WHITE);
+  cv.frame(x, y, w, h, 1, LGREY);
+  cv.box(x, y, 5, h, GOLD);
+  const pillH = 14;
+  const pillY = y + 5;
+  const pw = pillWidth(s.mark, 9);
+  drawPill(s.mark, x + w - 8 - pw, pillY, pillH, 9);
+  const headW = w - 14 - 8 - pw - 12;
+  const [tLines, tH] = fitText(s.title, 14, 11, headW, 1);
+  drawBlock(tLines, x + 14, y + 4, tH, tH + 3, INK);
+  // Sub-line sits 7px below the headline's ink bottom; the pill ends at
+  // pillY + 14 = y + 19, the sub-line starts at y + 24, so nothing touches.
+  const meta = s.region + " / " + s.field + "  -  " + s.src;
+  drawText(meta, x + 14, y + 24, 9, GREY, "l");
+}
 
-// ---------- assembly ----------
-function main() {
-  fillAll(PAPER);
-  // Masthead: solid filled caps, flanked by rules.
-  const mastBase = 56;
-  const mastW = dispWidth('24 NOVEMBER 2026', 44, 2);
-  drawDisplay('24 NOVEMBER 2026', W / 2, mastBase, 44, INK, 'c', 2);
-  hline(M, W / 2 - mastW / 2 - 18, 38, 2, INK);
-  hline(W / 2 + mastW / 2 + 18, W - M, 38, 2, INK);
-  // Subline: letterspaced small caps.
-  const subW = textWidth('TUESDAY - THE WORLD IN ONE DAY', 11, 3);
-  drawText('TUESDAY - THE WORLD IN ONE DAY', W / 2, 74, 11, 1.8, INK, 'c', 3);
-  hline(M, W / 2 - subW / 2 - 16, 68, 1, GRAY);
-  hline(W / 2 + subW / 2 + 16, W - M, 68, 1, GRAY);
-  // Count strip.
-  const regions = {};
-  const fields = {};
-  const all = LEADS.concat(CARDS1, CARDS2, BRIEFS);
-  for (const s of all) { regions[s.region] = (regions[s.region] || 0) + 1; fields[s.field] = 1; }
-  const nRegions = Object.keys(regions).length;
-  const nFields = Object.keys(fields).length;
-  fillRect(M, 84, CW, 26, INK);
-  drawText(all.length + ' STORIES • ' + nRegions + ' REGIONS • ' + nFields + ' FIELDS • ALL CHECKED TO 24 NOV 2026', W / 2, 102, 12, 2.2, PAPER, 'c', 1);
-  // Day strip: one line of times and figures, cells divided by hairlines.
-  const cellW = CW / DAY_STRIP.length;
-  for (let i = 0; i < DAY_STRIP.length; i++) {
-    const cx0 = M + i * cellW;
-    if (i > 0) vline(cx0, 118, 148, 1, LGRAY);
-    const val = DAY_STRIP[i][0], lab = DAY_STRIP[i][1], col = DAY_STRIP[i][2];
-    drawText(val, cx0 + cellW / 2, 131, 13, 2.6, col, 'c', 0);
-    drawText(lab, cx0 + cellW / 2, 145, 9.5, 1.5, GRAY, 'c', 0.5);
-  }
-  hline(M, W - M, 152, 1.2, INK);
-  // Leads.
-  const leadY = 162, leadH = 248, leadW = 310;
-  const leadXs = [M, M + leadW + 16, M + 2 * (leadW + 16)];
-  const leadScenes = [sceneKorea, sceneStocks, sceneRocket];
-  for (let i = 0; i < 3; i++) drawStoryPanel(leadXs[i], leadY, leadW, leadH, LEADS[i], leadScenes[i], i % 2 === 1, 100);
-  // Double rule between picture zone and cards.
-  doubleRule(M, W - M, 420, INK);
-  // Cards row 1.
-  const c1Y = 434, cH = 178, c1W = 230;
-  const c1Xs = [M, M + c1W + 14, M + 2 * (c1W + 14), M + 3 * (c1W + 14)];
-  const c1Scenes = [sceneDrone, sceneStrike, sceneGaza, sceneTanker];
-  for (let i = 0; i < 4; i++) drawStoryPanel(c1Xs[i], c1Y, c1W, cH, CARDS1[i], c1Scenes[i], i % 2 === 1, 52);
-  // Cards row 2.
-  const c2Y = 624, c2W = 312;
-  const c2Xs = [M, M + c2W + 14, M + 2 * (c2W + 14)];
-  const c2Scenes = [sceneQuake, sceneTreaty, scenePhone];
-  for (let i = 0; i < 3; i++) drawStoryPanel(c2Xs[i], c2Y, c2W, cH, CARDS2[i], c2Scenes[i], i % 2 === 0, 52);
-  // Briefs header + double rule.
-  drawText('MORE OF THE DAY', M, 824, 12, 2.4, INK, 'l', 2);
-  drawText('IN ORDER OF SIGNIFICANCE', W - M, 822, 9.5, 1.6, GRAY, 'r', 1);
-  doubleRule(M, W - M, 832, INK);
-  // Briefs: two columns, three rows.
-  const bColW = (CW - 14) / 2;
-  for (let i = 0; i < 6; i++) {
-    const col = i % 2, row = Math.floor(i / 2);
-    const bx = M + col * (bColW + 14);
-    const base = 856 + row * 26;
-    const b = BRIEFS[i];
-    const markW = textWidth(b.mark, 9, 0);
-    let tc = 12.5, sc = 10, total = 0;
-    while (true) {
-      total = textWidth(b.num + '. ', tc, 0) + textWidth(b.title, tc, 0) + textWidth(' - ' + b.src, sc, 0) + markW + 14;
-      if (total <= bColW || (tc <= 10 && sc <= 8.5)) break;
-      if (tc > 10) tc -= 0.5; else sc -= 0.5;
-    }
-    let tx = bx;
-    drawText(b.num + '.', tx, base, tc, 2.6, RED, 'l', 0);
-    tx += textWidth(b.num + '. ', tc, 0);
-    drawText(b.title, tx, base, tc, 2.3, INK, 'l', 0);
-    tx += textWidth(b.title, tc, 0);
-    drawText(' - ' + b.src, tx, base, sc, 1.6, GRAY, 'l', 0);
-    drawText(b.mark, bx + bColW, base, 9, 2.2, MARK_COLOR[b.mark], 'r', 0);
-  }
-  hline(M, W - M, 918, 1.2, INK);
-  // Footer labels.
-  drawText('WHERE THE DAY HAPPENED', M, 934, 10, 2, INK, 'l', 1.5);
-  drawText('DATE CHECK: OLD NEWS KEPT OUT', 350, 934, 10, 2, INK, 'l', 1);
-  drawText('HOW TO READ THE MARKS', 660, 934, 10, 2, INK, 'l', 1.5);
-  // Footer zone 1: dotted world map + region counts.
-  const mapX = M, mapY = 942, cell = 5;
-  for (let r = 0; r < MAP_ROWS.length; r++) {
-    for (let c = 0; c < MAP_ROWS[r].length; c++) {
-      if (MAP_ROWS[r][c] === '1') fillCircle(mapX + c * cell + cell / 2, mapY + r * cell + cell / 2, 1.6, NAVY);
-    }
-  }
-  const order = ['ASIA', 'EUROPE', 'MIDEAST', 'OCEANIA', 'N AMERICA'];
-  let cy2 = 956;
-  for (const rg of order) {
-    drawText(rg, mapX + 188, cy2, 9, 1.8, NAVY, 'l', 0.5);
-    drawText(String(regions[rg]), mapX + 188 + textWidth(rg, 9, 0.5) + 6, cy2, 9, 2.2, RED, 'l', 0);
-    cy2 += 12;
-  }
-  // Footer zone 2: date-check box.
-  fillRect(350, 942, 290, 62, PANEL);
-  polyline([[350, 942], [640, 942], [640, 1004], [350, 1004], [350, 942]], 1.2, INK, false);
-  let dy = 957;
-  drawText('KEPT OUT - NOT 24 NOV NEWS', 358, dy, 9.5, 2.2, RED, 'l', 0.5);
-  for (const item of DATE_CHECK) {
-    dy += 13;
-    drawText('• ' + item, 358, dy, 9, 1.6, INK, 'l', 0);
-  }
-  // Footer zone 3: legend.
-  const legend = [
-    ['CONFIRMED', 'MULTIPLE SOURCES', MARKG],
-    ['REPORTED', 'SINGLE SOURCE', MARKA],
-    ['CLAIM', 'UNVERIFIED CLAIM', MARKR]
+// ---------- dotted world map ----------
+function dottedMap(x: number, y: number, w: number, h: number): void {
+  cv.box(x, y, w, h, [230, 236, 238]);
+  const blobs: Array<[number, number, number, number]> = [
+    [0.16, 0.3, 0.13, 0.2],
+    [0.28, 0.22, 0.08, 0.12],
+    [0.24, 0.62, 0.07, 0.2],
+    [0.48, 0.24, 0.05, 0.1],
+    [0.52, 0.42, 0.07, 0.18],
+    [0.6, 0.26, 0.16, 0.22],
+    [0.72, 0.48, 0.1, 0.14],
+    [0.86, 0.72, 0.07, 0.09],
   ];
-  let ly = 956;
-  for (const row of legend) {
-    drawText(row[0], 660, ly, 9.5, 2.2, row[2], 'l', 0.5);
-    const lw = textWidth(row[0], 9.5, 0.5);
-    drawText(' - ' + row[1], 660 + lw, ly, 9.5, 1.6, GRAY, 'l', 0);
-    ly += 14;
+  for (let gy = y + 5; gy < y + h - 4; gy += 9) {
+    for (let gx = x + 5; gx < x + w - 4; gx += 9) {
+      const nx = (gx - x) / w;
+      const ny = (gy - y) / h;
+      for (const b of blobs) {
+        const dx = (nx - b[0]) / b[2];
+        const dy = (ny - b[1]) / b[3];
+        if (dx * dx + dy * dy <= 1) {
+          cv.disc(gx, gy, 2.2, NAVY2);
+          break;
+        }
+      }
+    }
   }
-  // Cut-off line.
-  drawText('CUT-OFF 08:00 UTC • AMERICAS DAYTIME TO BE RECHECKED IN FINAL EDITION • SOURCES AS CITED', W / 2, 1018, 8, 1.5, GRAY, 'c', 0.5);
-  // Write.
-  const outDir = process.env.MAKEFUN_OUTPUT_DIR || '/output';
+}
+
+// ---------- full layout ----------
+function render(): void {
+  cv.box(0, 0, W, H, PAPER);
+  // Masthead
+  cv.box(0, 0, W, 92, NAVY);
+  cv.box(0, 88, W, 4, GOLD);
+  drawText("24 NOVEMBER 2026", W / 2, 12, 46, WHITE, "c");
+  drawText("TUESDAY - THE WORLD IN ONE DAY", W / 2, 64, 14, GOLD, "c");
+  // Count strip, computed from the story table
+  const regions = new Set(STORIES.map((s) => s.region)).size;
+  const fields = new Set(STORIES.map((s) => s.field)).size;
+  const conf = STORIES.filter((s) => s.mark === "CONFIRMED").length;
+  const rep = STORIES.filter((s) => s.mark === "REPORTED").length;
+  const clm = STORIES.filter((s) => s.mark === "CLAIM").length;
+  const strip =
+    STORIES.length + " STORIES - " + regions + " REGIONS - " + fields + " FIELDS - " +
+    conf + " CONFIRMED - " + rep + " REPORTED - " + clm + " CLAIM";
+  cv.box(0, 92, W, 26, WHITE);
+  drawText(strip, W / 2, 100, 13, INK, "c");
+  cv.seg(0, 118, W, 118, 1, LGREY);
+  // Day strip: 5 cells
+  const dayCells: Array<[string, string]> = [
+    ["01:32 UTC", "NEPAL QUAKE"],
+    ["07:52 KST", "KADIZ FALSE ALARM"],
+    ["MON 23:00", "DRONE OVER POLAND"],
+    ["+6.3%", "KOSPI AT CLOSE"],
+    ["50,019", "DOW TOPS 50,000"],
+  ];
+  const cellW = 193;
+  for (let i = 0; i < 5; i++) {
+    const cx0 = 16 + i * (cellW + 6);
+    cv.box(cx0, 124, cellW, 46, i % 2 === 0 ? WHITE : PAPER2);
+    cv.frame(cx0, 124, cellW, 46, 1, LGREY);
+    drawText(dayCells[i][0], cx0 + cellW / 2, 129, 15, NAVY, "c");
+    drawText(dayCells[i][1], cx0 + cellW / 2, 149, 9.5, GREY, "c");
+  }
+  // Leads
+  const leads = STORIES.filter((s) => s.kind === "lead");
+  const leadXs = [16, 351, 686];
+  for (let i = 0; i < leads.length; i++) {
+    drawPanel(leads[i], leadXs[i], 176, 322, 224, true, 96);
+  }
+  // Cards, two rows of four
+  const cards = STORIES.filter((s) => s.kind === "card");
+  const cardXs = [16, 266, 516, 766];
+  for (let i = 0; i < 4; i++) drawPanel(cards[i], cardXs[i], 406, 240, 178, false, 72);
+  for (let i = 0; i < 4; i++) drawPanel(cards[4 + i], cardXs[i], 590, 240, 178, false, 72);
+  // Briefs band: header, then three tall rows (pitch 40, height 38)
+  drawText("MORE FROM TUESDAY", 16, 774, 12, NAVY, "l");
+  cv.seg(150, 780, W - 16, 780, 1, LGREY);
+  const briefs = STORIES.filter((s) => s.kind === "brief");
+  const briefW = 490;
+  for (let i = 0; i < briefs.length; i++) {
+    const col = i % 2;
+    const row = Math.floor(i / 2);
+    drawBrief(briefs[i], 16 + col * (briefW + 12), 788 + row * 40, briefW, 38);
+  }
+  // Footer
+  cv.box(0, 910, W, 92, WHITE);
+  cv.seg(0, 910, W, 910, 2, GOLD);
+  dottedMap(16, 918, 330, 66);
+  drawText("DOTTED WORLD MAP - NOT TO SCALE", 181, 988, 8, GREY, "c");
+  const order = ["ASIA", "EUROPE", "MIDEAST", "OCEANIA", "N AMERICA", "LATIN AMERICA"];
+  const counts = order
+    .map((r) => [r, STORIES.filter((s) => s.region === r).length] as [string, number])
+    .filter((p) => p[1] > 0);
+  drawText("STORIES BY REGION", 366, 920, 11, NAVY, "l");
+  drawText(counts.slice(0, 3).map((p) => p[0] + " " + p[1]).join("   "), 366, 936, 11, INK, "l");
+  drawText(counts.slice(3, 5).map((p) => p[0] + " " + p[1]).join("   "), 366, 951, 11, INK, "l");
+  drawText(counts.slice(5).map((p) => p[0] + " " + p[1]).join("   "), 366, 966, 11, INK, "l");
+  drawText("MARKS:", 366, 984, 9, GREY, "l");
+  let lx = 366 + measure("MARKS: ", 9) + 4;
+  const marks: Mark[] = ["CONFIRMED", "REPORTED", "CLAIM"];
+  for (const m of marks) {
+    const pw = pillWidth(m, 10);
+    drawPill(m, lx, 980, 16, 10);
+    lx += pw + 8;
+  }
+  // Date check box
+  cv.box(716, 918, 292, 72, PAPER2);
+  cv.frame(716, 918, 292, 72, 2, NAVY);
+  drawText("DATE CHECK - NOT 24 NOV NEWS", 730, 925, 11, NAVY, "l");
+  drawText("LIBYA STRIKE - NOV 22", 730, 943, 10, GREY, "l");
+  drawText("COP31 COLLAPSE - NOV 22", 730, 957, 10, GREY, "l");
+  drawText("NVIDIA CEO RETURNS - NOV 23", 730, 971, 10, GREY, "l");
+  // Bottom bar
+  cv.box(0, 1002, W, 22, NAVY);
+  drawText("FULL DAY CHECKED - 24 NOV 2026 - SOURCES AS CITED", W / 2, 1007, 11, WHITE, "c");
+}
+
+function main(): void {
+  const outDir = process.env.MAKEFUN_OUTPUT_DIR || "out";
   fs.mkdirSync(outDir, { recursive: true });
-  fs.writeFileSync(outDir + '/entry.png', encodePNG());
+  render();
+  fs.writeFileSync(outDir + "/entry.png", encodePng());
 }
 main();
